@@ -1,0 +1,445 @@
+const mongoose = require('mongoose');
+const crypto = require('crypto');
+const Order = require('../models/Order');
+const Product = require('../models/Product');
+const Seller = require('../models/Seller');
+const razorpay = require('../config/razorpay');
+const asyncHandler = require('../utils/asyncHandler');
+const { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus } = require('../utils/orderStatus');
+
+const generateOrderNumber = () => `BM${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
+const FLAT_SHIPPING_FEE = 49;
+const FREE_SHIPPING_THRESHOLD = 999;
+
+// POST /api/orders
+// Recalculates every price server-side from the live Product documents —
+// the frontend's prices/totals are never trusted. Stock is decremented
+// atomically inside a transaction so concurrent orders can't oversell.
+const createOrder = asyncHandler(async (req, res) => {
+  const { items, shippingAddress, paymentMethod } = req.body;
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ message: 'Order must contain at least one item' });
+  }
+  if (!shippingAddress) {
+    return res.status(400).json({ message: 'Shipping address is required' });
+  }
+  if (!['online', 'COD'].includes(paymentMethod)) {
+    return res.status(400).json({ message: "paymentMethod must be 'online' or 'COD'" });
+  }
+
+  const productIds = items.map((i) => i.productId);
+  const products = await Product.find({ _id: { $in: productIds } });
+  const productMap = new Map(products.map((p) => [String(p._id), p]));
+
+  const failures = [];
+  const orderItems = [];
+  let itemsTotal = 0;
+
+  items.forEach(({ productId, quantity }) => {
+    const product = productMap.get(String(productId));
+    const qty = Number(quantity);
+
+    if (!product) {
+      failures.push({ productId, reason: 'Product not found' });
+      return;
+    }
+    if (product.status !== 'active') {
+      failures.push({ productId, reason: 'Product is not available for purchase' });
+      return;
+    }
+    if (!qty || qty < 1) {
+      failures.push({ productId, reason: 'Invalid quantity' });
+      return;
+    }
+    if (product.stock < qty) {
+      failures.push({
+        productId,
+        reason: `Only ${product.stock} left in stock`,
+        availableStock: product.stock,
+      });
+      return;
+    }
+
+    const price = product.discountPrice ?? product.price;
+    const subtotal = price * qty;
+    itemsTotal += subtotal;
+
+    orderItems.push({
+      product: product._id,
+      seller: product.seller,
+      name: product.name,
+      image: product.images?.[0]?.url,
+      price,
+      quantity: qty,
+      subtotal,
+      itemStatus: 'placed',
+    });
+  });
+
+  if (failures.length > 0) {
+    return res.status(400).json({ message: 'Some items could not be ordered', failures });
+  }
+
+  // shippingFee/discount are derived server-side, never taken from the
+  // client, for the same reason item prices are recalculated above.
+  const shippingFee = itemsTotal >= FREE_SHIPPING_THRESHOLD ? 0 : FLAT_SHIPPING_FEE;
+  const discount = 0;
+  const totalAmount = itemsTotal + shippingFee - discount;
+  const orderNumber = generateOrderNumber();
+
+  const session = await mongoose.startSession();
+  let order;
+
+  try {
+    await session.withTransaction(async () => {
+      for (const item of orderItems) {
+        const updated = await Product.findOneAndUpdate(
+          { _id: item.product, stock: { $gte: item.quantity } },
+          { $inc: { stock: -item.quantity, totalSold: item.quantity } },
+          { session }
+        );
+        if (!updated) {
+          throw new Error(`STOCK_CONFLICT:${item.product}`);
+        }
+      }
+
+      const [createdOrder] = await Order.create(
+        [
+          {
+            orderNumber,
+            customer: req.user._id,
+            items: orderItems,
+            shippingAddress,
+            itemsTotal,
+            shippingFee,
+            discount,
+            totalAmount,
+            paymentMethod,
+            paymentStatus: 'pending',
+            orderStatus: 'placed',
+          },
+        ],
+        { session }
+      );
+      order = createdOrder;
+    });
+  } catch (err) {
+    if (err.message?.startsWith('STOCK_CONFLICT')) {
+      return res.status(409).json({ message: 'Stock changed while placing your order, please retry' });
+    }
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+
+  if (paymentMethod === 'online') {
+    const razorpayOrder = await razorpay.orders.create({
+      amount: Math.round(totalAmount * 100),
+      currency: 'INR',
+      receipt: order.orderNumber,
+    });
+    order.razorpay = { orderId: razorpayOrder.id };
+    await order.save();
+
+    return res.status(201).json({ order, razorpayOrder });
+  }
+
+  res.status(201).json({ order });
+});
+
+// GET /api/orders
+const getOrders = asyncHandler(async (req, res) => {
+  const { status, paymentStatus, dateFrom, dateTo, page = 1, limit = 20 } = req.query;
+  const filter = {};
+
+  if (req.user.role === 'customer') {
+    filter.customer = req.user._id;
+  } else if (req.user.role === 'seller') {
+    const seller = await Seller.findOne({ user: req.user._id });
+    filter['items.seller'] = seller?._id;
+  }
+
+  if (status) filter.orderStatus = status;
+  if (paymentStatus) filter.paymentStatus = paymentStatus;
+
+  if (dateFrom || dateTo) {
+    filter.createdAt = {};
+    if (dateFrom) filter.createdAt.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+    if (dateTo) filter.createdAt.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+  }
+
+  const pageNum = Number(page);
+  const limitNum = Number(limit);
+
+  const [orders, total] = await Promise.all([
+    Order.find(filter)
+      .populate('customer', 'name email phone')
+      .sort('-createdAt')
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum),
+    Order.countDocuments(filter),
+  ]);
+
+  res.json({ orders, total, page: pageNum, limit: limitNum });
+});
+
+// GET /api/orders/:id
+const getOrderById = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id)
+    .populate('customer', 'name email phone')
+    .populate('items.product', 'name slug sku images price discountPrice')
+    .populate('items.seller', 'businessName');
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  if (req.user.role === 'customer' && String(order.customer) !== String(req.user._id)) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+
+  if (req.user.role === 'seller') {
+    const seller = await Seller.findOne({ user: req.user._id });
+    const ownsItem = order.items.some((item) => String(item.seller) === String(seller?._id));
+    if (!ownsItem) {
+      return res.status(403).json({ message: 'You have no items in this order' });
+    }
+  }
+
+  res.json({ order });
+});
+
+// PATCH /api/orders/:id/admin-status
+const adminUpdateOrderStatus = asyncHandler(async (req, res) => {
+  const { status, refundStatus, shipment } = req.body;
+  const validStatuses = ['placed', 'packed', 'shipped', 'delivered', 'cancelled', 'rto'];
+  const validRefundStatuses = ['refund_pending', 'refunded'];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ message: 'Invalid status' });
+  }
+
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  order.items.forEach((item) => {
+    item.itemStatus = status;
+
+    if (shipment || status === 'shipped' || status === 'delivered') {
+      const shipmentUpdate = { ...(item.shipment?.toObject?.() ?? {}), ...(shipment ?? {}) };
+      if (status === 'shipped') {
+        shipmentUpdate.shipmentStatus = shipmentUpdate.shipmentStatus ?? 'shipped';
+        shipmentUpdate.shippedAt = shipmentUpdate.shippedAt ?? new Date();
+      }
+      if (status === 'delivered') {
+        shipmentUpdate.shipmentStatus = 'delivered';
+        shipmentUpdate.deliveredAt = new Date();
+      }
+      item.shipment = shipmentUpdate;
+    }
+  });
+
+  order.orderStatus = status;
+
+  if (refundStatus !== undefined) {
+    if (!validRefundStatuses.includes(refundStatus)) {
+      return res.status(400).json({ message: 'Invalid refund status' });
+    }
+    order.refundStatus = refundStatus;
+    if (refundStatus === 'refunded') {
+      order.paymentStatus = 'refunded';
+    }
+  }
+
+  await order.save();
+  res.json({ order });
+});
+
+// PATCH /api/orders/:id/refund-status
+const updateRefundStatus = asyncHandler(async (req, res) => {
+  const { refundStatus } = req.body;
+  if (!['refund_pending', 'refunded'].includes(refundStatus)) {
+    return res.status(400).json({ message: 'Invalid refund status' });
+  }
+
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  order.refundStatus = refundStatus;
+  if (refundStatus === 'refunded') {
+    order.paymentStatus = 'refunded';
+  }
+
+  await order.save();
+  res.json({ order });
+});
+
+// POST /api/orders/:id/verify-payment
+const verifyPayment = asyncHandler(async (req, res) => {
+  const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
+
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+  if (String(order.customer) !== String(req.user._id)) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+  if (order.paymentMethod !== 'online') {
+    return res.status(400).json({ message: 'This order is not an online payment order' });
+  }
+
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest('hex');
+
+  if (expectedSignature !== razorpaySignature) {
+    return res.status(400).json({ message: 'Payment signature verification failed' });
+  }
+
+  order.paymentStatus = 'paid';
+  order.razorpay = {
+    orderId: razorpayOrderId,
+    paymentId: razorpayPaymentId,
+    signature: razorpaySignature,
+  };
+  await order.save();
+
+  res.json({ order });
+});
+
+// PATCH /api/orders/:id/mark-cod-paid
+const markCodPaid = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+  if (order.paymentMethod !== 'COD') {
+    return res.status(400).json({ message: 'Only COD orders can be marked paid this way' });
+  }
+
+  if (req.user.role === 'seller') {
+    const seller = await Seller.findOne({ user: req.user._id });
+    const ownsItem = order.items.some((item) => String(item.seller) === String(seller?._id));
+    if (!ownsItem) {
+      return res.status(403).json({ message: 'You have no items in this order' });
+    }
+  }
+
+  order.paymentStatus = 'paid';
+  await order.save();
+  res.json({ order });
+});
+
+// PATCH /api/orders/:id/items/:itemId/status
+const updateItemStatus = asyncHandler(async (req, res) => {
+  const { status, shipment } = req.body;
+  const validStatuses = ['placed', 'packed', 'shipped', 'delivered', 'cancelled', 'rto'];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ message: 'Invalid status' });
+  }
+
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  const item = order.items.id(req.params.itemId);
+  if (!item) {
+    return res.status(404).json({ message: 'Order item not found' });
+  }
+
+  if (req.user.role === 'seller') {
+    const seller = await Seller.findOne({ user: req.user._id });
+    if (!seller || String(item.seller) !== String(seller._id)) {
+      return res.status(403).json({ message: 'You do not own this item' });
+    }
+  }
+
+  if (TERMINAL_ITEM_STATUSES.includes(item.itemStatus)) {
+    return res.status(400).json({ message: `Item is already ${item.itemStatus} and cannot be changed` });
+  }
+
+  if (!TERMINAL_ITEM_STATUSES.includes(status) && ITEM_STATUS_RANK[status] <= ITEM_STATUS_RANK[item.itemStatus]) {
+    return res.status(400).json({ message: `Cannot move item status backward from ${item.itemStatus} to ${status}` });
+  }
+
+  item.itemStatus = status;
+
+  if (shipment || status === 'shipped' || status === 'delivered') {
+    const shipmentUpdate = { ...(item.shipment?.toObject?.() ?? {}), ...(shipment ?? {}) };
+    if (status === 'shipped') {
+      shipmentUpdate.shipmentStatus = shipmentUpdate.shipmentStatus ?? 'shipped';
+      shipmentUpdate.shippedAt = shipmentUpdate.shippedAt ?? new Date();
+    }
+    if (status === 'delivered') {
+      shipmentUpdate.shipmentStatus = 'delivered';
+      shipmentUpdate.deliveredAt = new Date();
+    }
+    item.shipment = shipmentUpdate;
+  }
+
+  recalcOrderStatus(order);
+  await order.save();
+
+  res.json({ order });
+});
+
+// PATCH /api/orders/:id/cancel
+const cancelOrder = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  if (req.user.role === 'customer' && String(order.customer) !== String(req.user._id)) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+
+  if (!['placed', 'packed', 'shipped'].includes(order.orderStatus)) {
+    return res.status(400).json({ message: `Order cannot be cancelled from status '${order.orderStatus}'` });
+  }
+
+  const { reason } = req.body;
+
+  const cancellableItems = order.items.filter(
+    (item) => !TERMINAL_ITEM_STATUSES.includes(item.itemStatus) && item.itemStatus !== 'delivered'
+  );
+
+  await Promise.all(
+    cancellableItems.map((item) =>
+      Product.findByIdAndUpdate(item.product, {
+        $inc: { stock: item.quantity, totalSold: -item.quantity },
+      })
+    )
+  );
+
+  cancellableItems.forEach((item) => {
+    item.itemStatus = 'cancelled';
+  });
+
+  order.orderStatus = 'cancelled';
+  order.cancelReason = reason;
+  await order.save();
+
+  res.json({ order });
+});
+
+module.exports = {
+  createOrder,
+  getOrders,
+  getOrderById,
+  verifyPayment,
+  markCodPaid,
+  updateItemStatus,
+  adminUpdateOrderStatus,
+  updateRefundStatus,
+  cancelOrder,
+};

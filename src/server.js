@@ -1,13 +1,75 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const connectDB = require('./config/db');
-const cloudinary = require('./config/cloudinary');
-console.log('Cloudinary configured:', cloudinary.config().cloud_name);
+require('./config/cloudinary');
+
+const authRoutes = require('./routes/authRoutes');
+const productRoutes = require('./routes/productRoutes');
+const categoryRoutes = require('./routes/categoryRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const sellerRoutes = require('./routes/sellerRoutes');
+const cartRoutes = require('./routes/cartRoutes');
+const orderRoutes = require('./routes/orderRoutes');
+const reviewRoutes = require('./routes/reviewRoutes');
+const homepageRoutes = require('./routes/homepageRoutes');
+
 connectDB();
 
 const app = express();
 
+app.use(cors({
+  origin: process.env.FRONTEND_URL ||'http://localhost:4200',
+  credentials: true, // important — httpOnly cookies ke liye zaruri hai
+}));
+app.use(express.json());
+app.use(cookieParser());
+
 app.get('/', (req, res) => res.send('BohraMarket API running'));
+
+app.use('/api/auth', authRoutes);
+app.use('/api/products', productRoutes);
+app.use('/api/categories', categoryRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/sellers', sellerRoutes);
+app.use('/api/cart', cartRoutes);
+app.use('/api/orders', orderRoutes);
+app.use('/api/reviews', reviewRoutes);
+app.use('/api/homepage', homepageRoutes);
+
+app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
+
+app.use((err, req, res, next) => {
+  console.error(`[${req.method} ${req.originalUrl}]`, err);
+
+  if (err.name === 'MulterError') {
+    return res.status(400).json({ message: err.message || 'File upload failed' });
+  }
+
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      message: 'Validation failed',
+      errors: Object.values(err.errors || {}).map((fieldError) => fieldError.message),
+    });
+  }
+
+  if (err.name === 'CastError') {
+    return res.status(400).json({ message: `Invalid ${err.path}` });
+  }
+
+  if (err.code === 11000) {
+    return res.status(409).json({ message: 'A record with this value already exists' });
+  }
+
+  if (typeof err.message === 'string' && /format .* not allowed/i.test(err.message)) {
+    return res.status(400).json({ message: err.message });
+  }
+
+  res.status(err.statusCode || 500).json({
+    message: err.message || 'Server error',
+  });
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

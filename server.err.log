@@ -1,0 +1,8 @@
+[POST /api/orders] {
+  statusCode: 401,
+  error: { code: 'BAD_REQUEST_ERROR', description: 'Authentication failed' }
+}
+[POST /api/orders] {
+  statusCode: 401,
+  error: { code: 'BAD_REQUEST_ERROR', description: 'Authentication failed' }
+}
