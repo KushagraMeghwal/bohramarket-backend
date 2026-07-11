@@ -20,7 +20,7 @@ connectDB();
 const app = express();
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL ||'http://localhost:4200',
+  origin: process.env.FRONTEND_URL ||'https://bohramart-6e152.web.app',
   credentials: true, // important — httpOnly cookies ke liye zaruri hai
 }));
 app.use(express.json());
