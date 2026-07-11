@@ -19,10 +19,27 @@ connectDB();
 
 const app = express();
 
+app.set('trust proxy', 1);
+
+const allowedOrigins = [
+  'https://bohramart-6e152.web.app',
+  'https://bohramart-6e152.firebaseapp.com',
+  'http://localhost:4200'
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL ||'https://bohramart-6e152.web.app',
-  credentials: true, // important — httpOnly cookies ke liye zaruri hai
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
+app.options('*', cors());
 app.use(express.json());
 app.use(cookieParser());
 
