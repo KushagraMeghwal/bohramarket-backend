@@ -1,7 +1,7 @@
 const User = require('../models/User');
 const Seller = require('../models/Seller');
 const asyncHandler = require('../utils/asyncHandler');
-const { generateToken, TOKEN_COOKIE_NAME } = require('../utils/generateToken');
+const { generateToken, TOKEN_COOKIE_NAME, COOKIE_OPTIONS } = require('../utils/generateToken');
 
 // The frontend's route guards decide where to send a seller (onboarding form,
 // pending-approval screen, or dashboard) based on this status, so it has to
@@ -75,7 +75,7 @@ const login = asyncHandler(async (req, res) => {
 
 // POST /api/auth/logout
 const logout = (req, res) => {
-  res.clearCookie(TOKEN_COOKIE_NAME);
+  res.clearCookie(TOKEN_COOKIE_NAME, COOKIE_OPTIONS);
   res.json({ message: 'Logged out' });
 };
 
