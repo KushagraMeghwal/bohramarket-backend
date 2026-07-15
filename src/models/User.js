@@ -27,7 +27,17 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
-    password: { type: String, required: true, select: false },
+    // Not required for Google accounts (authProvider: 'google') — those users
+    // never set a local password and sign in via Firebase ID token instead.
+    password: {
+      type: String,
+      required: function passwordRequired() {
+        return this.authProvider !== 'google';
+      },
+      select: false,
+    },
+    authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
+    googleId: { type: String, select: false, sparse: true, unique: true },
     phone: { type: String, trim: true },
     role: {
       type: String,
@@ -48,6 +58,8 @@ userSchema.pre('save', async function hashPassword() {
 });
 
 userSchema.methods.comparePassword = function comparePassword(candidate) {
+  // Google-only accounts have no local password to compare against.
+  if (!this.password) return Promise.resolve(false);
   return bcrypt.compare(candidate, this.password);
 };
 

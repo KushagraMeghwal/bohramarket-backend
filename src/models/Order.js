@@ -98,6 +98,10 @@ const orderSchema = new mongoose.Schema(
       orderId: String,
       paymentId: String,
       signature: String,
+      method: String, // upi | card | netbanking | wallet, from the captured payment entity
+      capturedAt: Date,
+      failureReason: String, // Razorpay's short error code (e.g. BAD_REQUEST_ERROR)
+      failureDescription: String,
     },
     // Aggregate status derived from item statuses: the order is only as
     // advanced as its least-advanced non-terminal item (see recalcOrderStatus).

@@ -32,7 +32,7 @@ const DEFAULT_CONTENT = {
     { icon: '🚚', title: 'Free Shipping', sub: 'On orders above Rs 999' },
     { icon: '🛡️', title: 'Buyer Protection', sub: 'Verified sellers only' },
     { icon: '↩️', title: 'Easy Returns', sub: '7-day return window' },
-    { icon: '💬', title: '24/7 Support', sub: 'Real humans, real fast' },
+    { icon: '💬', title: '24/7 Support', sub: '' },
   ],
   topRatedTitle: 'Top Rated, Most Loved',
   topRatedSubtitle: 'Highest rated picks from sellers across every category',

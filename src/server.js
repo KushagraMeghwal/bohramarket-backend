@@ -14,6 +14,7 @@ const cartRoutes = require('./routes/cartRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const reviewRoutes = require('./routes/reviewRoutes');
 const homepageRoutes = require('./routes/homepageRoutes');
+const webhookRoutes = require('./routes/webhookRoutes');
 
 connectDB();
 
@@ -39,6 +40,14 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// Must be mounted before express.json(): Razorpay signs the exact raw
+// request bytes, and once express.json() parses+re-serializes a body the
+// HMAC in webhookController would no longer match. This router applies its
+// own express.raw() scoped to just the webhook path; every other route
+// still gets the normal parsed JSON body below.
+app.use('/api/webhooks', webhookRoutes);
+
 app.use(express.json());
 app.use(cookieParser());
 
