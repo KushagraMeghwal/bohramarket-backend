@@ -36,6 +36,11 @@ const shipmentSchema = new mongoose.Schema(
     },
     shiprocketOrderId: String,
     shiprocketShipmentId: String,
+    // Verbatim status string from Shiprocket's tracking webhook/API — kept
+    // separate from shipmentStatus above (which drives this app's own
+    // fulfillment state machine) so raw courier text never has to be forced
+    // into that constrained enum.
+    courierStatus: String,
     shippedAt: Date,
     deliveredAt: Date,
   },
@@ -92,6 +97,16 @@ const orderSchema = new mongoose.Schema(
     refundStatus: {
       type: String,
       enum: ['none', 'refund_pending', 'refunded'],
+      default: 'none',
+    },
+    // Set once, when the order first reaches orderStatus 'delivered' (7 days
+    // out from that moment). One window for the whole order — items across
+    // sellers can still ship/deliver at different times, but this is
+    // intentionally simple rather than tracking a return window per item.
+    returnEligibleUntil: Date,
+    returnStatus: {
+      type: String,
+      enum: ['none', 'requested', 'approved', 'rejected', 'completed'],
       default: 'none',
     },
     razorpay: {

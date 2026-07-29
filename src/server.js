@@ -14,6 +14,7 @@ const cartRoutes = require('./routes/cartRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const reviewRoutes = require('./routes/reviewRoutes');
 const homepageRoutes = require('./routes/homepageRoutes');
+const siteContentRoutes = require('./routes/siteContentRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 
 connectDB();
@@ -62,6 +63,7 @@ app.use('/api/cart', cartRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/reviews', reviewRoutes);
 app.use('/api/homepage', homepageRoutes);
+app.use('/api/site-content', siteContentRoutes);
 
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 

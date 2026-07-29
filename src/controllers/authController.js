@@ -47,9 +47,9 @@ const register = asyncHandler(async (req, res) => {
 
   const user = await User.create({ name, email, password, phone, role: role || 'customer' });
 
-  generateToken(res, user._id, user.role);
+  const token = generateToken(res, user._id, user.role);
 
-  res.status(201).json({ user: await serializeUser(user) });
+  res.status(201).json({ user: await serializeUser(user), token });
 });
 
 // POST /api/auth/login
@@ -69,9 +69,9 @@ const login = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Account suspended' });
   }
 
-  generateToken(res, user._id, user.role);
+  const token = generateToken(res, user._id, user.role);
 
-  res.json({ user: await serializeUser(user) });
+  res.json({ user: await serializeUser(user), token });
 });
 
 // POST /api/auth/google
@@ -119,9 +119,9 @@ const googleAuth = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Account suspended' });
   }
 
-  generateToken(res, user._id, user.role);
+  const token = generateToken(res, user._id, user.role);
 
-  res.json({ user: await serializeUser(user) });
+  res.json({ user: await serializeUser(user), token });
 });
 
 // POST /api/auth/logout

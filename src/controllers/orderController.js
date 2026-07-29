@@ -3,9 +3,12 @@ const crypto = require('crypto');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Seller = require('../models/Seller');
+const User = require('../models/User');
 const razorpay = require('../config/razorpay');
 const asyncHandler = require('../utils/asyncHandler');
-const { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus } = require('../utils/orderStatus');
+const { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus, maybeStartReturnWindow } = require('../utils/orderStatus');
+const { createShipmentForOrder } = require('../services/orderFulfillment.service');
+const shiprocketService = require('../services/shiprocket.service');
 
 const generateOrderNumber = () => `BM${Date.now()}${Math.floor(Math.random() * 1000)}`;
 
@@ -146,6 +149,12 @@ const createOrder = asyncHandler(async (req, res) => {
     return res.status(201).json({ order, razorpayOrder });
   }
 
+  // COD orders are "confirmed" the moment they're placed — there's no
+  // separate payment step to wait for the way there is for online orders
+  // (see verifyPayment / webhookController.handlePaymentCaptured). Not
+  // awaited: a Shiprocket outage shouldn't delay or fail order placement.
+  createShipmentForOrder(order);
+
   res.status(201).json({ order });
 });
 
@@ -195,13 +204,23 @@ const getOrderById = asyncHandler(async (req, res) => {
     return res.status(404).json({ message: 'Order not found' });
   }
 
-  if (req.user.role === 'customer' && String(order.customer) !== String(req.user._id)) {
+  const isBuyer = String(order.customer._id) === String(req.user._id);
+
+  if (req.user.role === 'customer' && !isBuyer) {
     return res.status(403).json({ message: 'Not your order' });
   }
 
-  if (req.user.role === 'seller') {
+  // A seller sees an order either as the fulfilling seller (they own items
+  // in it) or, since sellers can also place orders as buyers, as the
+  // customer who placed it — either is enough to view it.
+  //
+  // item.seller is populated above (items.seller -> businessName), so it's a
+  // full Document here, not a bare ObjectId — String(item.seller) would
+  // stringify the whole object, not its id, and never match. Read ._id
+  // first so this works whether or not the field ends up populated.
+  if (req.user.role === 'seller' && !isBuyer) {
     const seller = await Seller.findOne({ user: req.user._id });
-    const ownsItem = order.items.some((item) => String(item.seller) === String(seller?._id));
+    const ownsItem = order.items.some((item) => String(item.seller?._id ?? item.seller) === String(seller?._id));
     if (!ownsItem) {
       return res.status(403).json({ message: 'You have no items in this order' });
     }
@@ -243,6 +262,7 @@ const adminUpdateOrderStatus = asyncHandler(async (req, res) => {
   });
 
   order.orderStatus = status;
+  maybeStartReturnWindow(order);
 
   if (refundStatus !== undefined) {
     if (!validRefundStatuses.includes(refundStatus)) {
@@ -310,6 +330,12 @@ const verifyPayment = asyncHandler(async (req, res) => {
     signature: razorpaySignature,
   };
   await order.save();
+
+  // Not awaited — see createOrder's COD call for why. The Razorpay
+  // payment.captured webhook also calls this for the same order; the
+  // idempotency check inside createShipmentForOrder is what stops whichever
+  // of the two fires second from double-booking the shipment.
+  createShipmentForOrder(order);
 
   res.json({ order });
 });
@@ -387,23 +413,35 @@ const updateItemStatus = asyncHandler(async (req, res) => {
   }
 
   recalcOrderStatus(order);
+  maybeStartReturnWindow(order);
   await order.save();
 
   res.json({ order });
 });
 
 // PATCH /api/orders/:id/cancel
+// Kept as the existing PATCH endpoint rather than adding a separate POST
+// route — this codebase already had a working cancelOrder (stock restore,
+// role checks, etc.) and the frontend already calls PATCH; a second route
+// doing overlapping-but-different cancel logic would be a bug waiting to
+// happen rather than a real addition. This now also tightens the allowed
+// states and cancels any Shiprocket shipment already created for the order.
 const cancelOrder = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) {
     return res.status(404).json({ message: 'Order not found' });
   }
 
-  if (req.user.role === 'customer' && String(order.customer) !== String(req.user._id)) {
+  // Only admins may cancel someone else's order; customer and seller
+  // accounts (sellers can place orders as buyers too, see orderRoutes.js
+  // BUYER_ROLES) may only cancel their own.
+  if (req.user.role !== 'admin' && String(order.customer) !== String(req.user._id)) {
     return res.status(403).json({ message: 'Not your order' });
   }
 
-  if (!['placed', 'packed', 'shipped'].includes(order.orderStatus)) {
+  // Cancellation is only offered before the order ships — once a courier has
+  // picked it up, this needs to become a return instead (see requestReturn).
+  if (!['placed', 'packed'].includes(order.orderStatus)) {
     return res.status(400).json({ message: `Order cannot be cancelled from status '${order.orderStatus}'` });
   }
 
@@ -429,7 +467,156 @@ const cancelOrder = asyncHandler(async (req, res) => {
   order.cancelReason = reason;
   await order.save();
 
+  // Best-effort: cancelling in our DB is the source of truth for the buyer;
+  // a Shiprocket API hiccup here shouldn't block that response. Only one
+  // cancel call per unique Shiprocket order id, since several items from the
+  // same seller share one Shiprocket order.
+  const shiprocketOrderIds = [
+    ...new Set(order.items.map((item) => item.shipment?.shiprocketOrderId).filter(Boolean)),
+  ];
+  await Promise.all(
+    shiprocketOrderIds.map((id) =>
+      shiprocketService
+        .cancelShipmentOrder(id)
+        .catch((err) => console.error(`[shiprocket] failed to cancel shipment order ${id}`, err))
+    )
+  );
+
   res.json({ order });
+});
+
+// POST /api/orders/:id/return
+const requestReturn = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id).populate('items.seller');
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+  if (String(order.customer) !== String(req.user._id)) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+
+  if (!order.returnEligibleUntil || Date.now() > order.returnEligibleUntil.getTime()) {
+    return res.status(400).json({ message: 'Return window closed' });
+  }
+  if (order.returnStatus !== 'none') {
+    return res.status(400).json({ message: `A return has already been ${order.returnStatus} for this order` });
+  }
+
+  // One Shiprocket return order per seller, same reasoning as
+  // createShipmentForOrder — a return ships back to whichever seller's
+  // warehouse the item came from, and Shiprocket has no multi-destination
+  // concept for a single order.
+  const sellerIds = [...new Set(order.items.map((item) => String(item.seller?._id || item.seller)))];
+  const sellerUsers = await User.find({
+    _id: { $in: order.items.map((item) => item.seller?.user).filter(Boolean) },
+  }).select('email');
+  const sellerEmailByUserId = new Map(sellerUsers.map((u) => [String(u._id), u.email]));
+
+  for (const sellerId of sellerIds) {
+    const groupItems = order.items.filter((item) => String(item.seller?._id || item.seller) === sellerId);
+    const seller = groupItems[0].seller;
+    if (!seller || typeof seller === 'string') {
+      console.warn(`[shiprocket] return for order ${order.orderNumber}: seller ${sellerId} not populated, skipping`);
+      continue;
+    }
+
+    try {
+      await shiprocketService.requestReturn({
+        orderNumber: order.orderNumber,
+        orderDate: order.createdAt,
+        customer: { name: order.shippingAddress.fullName, phone: order.shippingAddress.phone, email: req.user.email },
+        shippingAddress: order.shippingAddress,
+        sellerName: seller.businessName,
+        sellerAddress: seller.pickupAddress,
+        sellerEmail: sellerEmailByUserId.get(String(seller.user)) || 'orders@bohramart.example',
+        sellerPhone: seller.contactPhone,
+        items: groupItems.map((item) => ({ name: item.name, sku: String(item.product), quantity: item.quantity, price: item.price })),
+        subTotal: groupItems.reduce((sum, item) => sum + item.subtotal, 0),
+      });
+    } catch (err) {
+      console.error(`[shiprocket] return request failed for order ${order.orderNumber}, seller ${sellerId}`, err);
+      return res.status(502).json({ message: 'Could not initiate the return with our courier partner. Please try again shortly.' });
+    }
+  }
+
+  order.returnStatus = 'requested';
+  await order.save();
+
+  res.json({ order });
+});
+
+// GET /api/orders/:id/track
+// Calls Shiprocket's live tracking API for each shipment on this order.
+// Falls back to whatever's already stored on the order (from the last
+// tracking webhook update) if the live call fails or a shipment doesn't
+// exist yet — a Shiprocket outage should make this page stale, not broken.
+const trackOrder = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+
+  const isBuyer = String(order.customer) === String(req.user._id);
+  if (req.user.role === 'customer' && !isBuyer) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+  if (req.user.role === 'seller' && !isBuyer) {
+    const seller = await Seller.findOne({ user: req.user._id });
+    const ownsItem = order.items.some((item) => String(item.seller) === String(seller?._id));
+    if (!ownsItem) {
+      return res.status(403).json({ message: 'You have no items in this order' });
+    }
+  }
+
+  const seenShipmentIds = new Set();
+  const tracking = [];
+
+  for (const item of order.items) {
+    const shipmentId = item.shipment?.shiprocketShipmentId;
+    const fallback = {
+      itemId: item._id,
+      itemName: item.name,
+      awb: item.shipment?.awbNumber || null,
+      courierName: item.shipment?.courierName || null,
+      status: item.shipment?.courierStatus || item.shipment?.shipmentStatus || item.itemStatus,
+      trackingUrl: item.shipment?.awbNumber ? `https://shiprocket.co/tracking/${item.shipment.awbNumber}` : null,
+      scans: [],
+      live: false,
+    };
+
+    if (!shipmentId || seenShipmentIds.has(shipmentId)) {
+      tracking.push(fallback);
+      continue;
+    }
+    seenShipmentIds.add(shipmentId);
+
+    try {
+      const liveData = await shiprocketService.trackShipment(shipmentId);
+      // Shiprocket's tracking response shape varies by account/endpoint
+      // version — read every field defensively rather than assuming one
+      // exact structure, and always fall back to our own stored status.
+      const trackData = liveData?.tracking_data || liveData;
+      const activities = trackData?.shipment_track_activities || trackData?.shipment_track || [];
+
+      tracking.push({
+        ...fallback,
+        status: trackData?.track_status || trackData?.current_status || fallback.status,
+        scans: Array.isArray(activities)
+          ? activities.map((activity) => ({
+              date: activity.date || '',
+              status: activity.activity || activity.status || '',
+              location: activity.location || '',
+            }))
+          : [],
+        live: true,
+      });
+    } catch (err) {
+      console.error(`[shiprocket] live tracking failed for shipment ${shipmentId}`, err.message || err);
+      tracking.push(fallback);
+    }
+  }
+
+  res.json({ tracking });
 });
 
 module.exports = {
@@ -442,4 +629,6 @@ module.exports = {
   adminUpdateOrderStatus,
   updateRefundStatus,
   cancelOrder,
+  requestReturn,
+  trackOrder,
 };

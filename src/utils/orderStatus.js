@@ -16,4 +16,17 @@ const recalcOrderStatus = (order) => {
   order.orderStatus = Object.keys(ITEM_STATUS_RANK).find((key) => ITEM_STATUS_RANK[key] === minRank);
 };
 
-module.exports = { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus };
+const RETURN_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Called wherever order.orderStatus is being set to 'delivered' (customer
+// order-item updates, admin bulk status updates, the Shiprocket tracking
+// webhook) — starts the 7-day return window from that moment. Only set
+// once: a later re-save that happens to pass through 'delivered' again
+// (e.g. an admin correction) shouldn't push the window back out.
+const maybeStartReturnWindow = (order) => {
+  if (order.orderStatus === 'delivered' && !order.returnEligibleUntil) {
+    order.returnEligibleUntil = new Date(Date.now() + RETURN_WINDOW_MS);
+  }
+};
+
+module.exports = { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus, maybeStartReturnWindow };

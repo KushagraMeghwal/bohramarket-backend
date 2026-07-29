@@ -3,9 +3,25 @@ const User = require('../models/User');
 const asyncHandler = require('../utils/asyncHandler');
 const { TOKEN_COOKIE_NAME } = require('../utils/generateToken');
 
-// Blocks the request unless a valid, active-user token cookie is present.
+// Frontend and backend live on different domains, which makes the auth
+// cookie a third-party cookie from the browser's point of view — browsers
+// increasingly throttle or drop those outright, causing users to get
+// silently logged out mid-session even though their login was never
+// actually invalidated. The Authorization header is the reliable path (the
+// frontend attaches it explicitly from a token it stores itself, so nothing
+// about it depends on the browser's cookie policy); the cookie is kept only
+// as a fallback for same-origin / non-browser callers.
+const extractToken = (req) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice('Bearer '.length);
+  }
+  return req.cookies?.[TOKEN_COOKIE_NAME];
+};
+
+// Blocks the request unless a valid, active-user token is present.
 const verifyToken = asyncHandler(async (req, res, next) => {
-  const token = req.cookies?.[TOKEN_COOKIE_NAME];
+  const token = extractToken(req);
 
   if (!token) {
     return res.status(401).json({ message: 'Not authenticated' });
@@ -30,7 +46,7 @@ const verifyToken = asyncHandler(async (req, res, next) => {
 // Attaches req.user when a valid token cookie exists, but lets the request
 // through regardless — for routes that serve both logged-out and logged-in users.
 const optionalAuth = asyncHandler(async (req, res, next) => {
-  const token = req.cookies?.[TOKEN_COOKIE_NAME];
+  const token = extractToken(req);
   if (!token) return next();
 
   try {

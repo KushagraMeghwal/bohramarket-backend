@@ -38,6 +38,10 @@ const sellerSchema = new mongoose.Schema(
       pincode: { type: String, required: true },
       country: { type: String, default: 'India' },
     },
+    // Registered lazily the first time this seller ships an order — see
+    // shiprocket.service.js ensurePickupLocation(). Shiprocket's adhoc order
+    // API references pickup addresses by this nickname, not raw address fields.
+    shiprocketPickupLocationName: String,
     bankDetails: {
       accountHolderName: String,
       accountNumber: String,

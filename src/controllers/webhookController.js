@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const Order = require('../models/Order');
 const WebhookEvent = require('../models/WebhookEvent');
+const { createShipmentForOrder } = require('../services/orderFulfillment.service');
+const { recalcOrderStatus, maybeStartReturnWindow, TERMINAL_ITEM_STATUSES } = require('../utils/orderStatus');
 
 // Pulls the Razorpay entity id relevant to this event type — used to build a
 // stable idempotency key, since Razorpay does not guarantee a distinct
@@ -124,6 +126,12 @@ async function handlePaymentCaptured(payment) {
 
   console.log(`[razorpay webhook] order ${order.orderNumber} marked paid via payment.captured (${payment.id})`);
 
+  // Not awaited — see createShipmentForOrder's own comment. This is the
+  // authoritative trigger for online orders (the frontend's verifyPayment
+  // call is a secondary, redundant one — see orderController.js); the
+  // idempotency check inside createShipmentForOrder covers whichever fires second.
+  createShipmentForOrder(order);
+
   // Cart clearing: CartService.checkout() on the frontend already clears the
   // cart right after order creation (before payment even starts), so there's
   // nothing left to clear here — see cart.service.ts.
@@ -196,4 +204,97 @@ async function handleRefundProcessed(refund) {
   console.log(`[razorpay webhook] order ${order.orderNumber} marked refunded (refund ${refund.id})`);
 }
 
-module.exports = { handleRazorpayWebhook };
+// POST /api/webhooks/shiprocket
+// Shiprocket's webhook auth model is a static shared-secret header you
+// choose yourself when registering the webhook in their dashboard — not an
+// HMAC signature the way Razorpay's is. Verified against
+// SHIPROCKET_WEBHOOK_TOKEN if that env var is set; if it isn't, verification
+// is skipped (documented in .env.example) rather than hard-failing, since
+// Shiprocket will still work without one configured, just without this check.
+//
+// NOTE: the field names read out of `body` below are transcribed from
+// Shiprocket's public webhook docs, not confirmed against a live delivery in
+// this change. The console.log below prints the full raw payload on every
+// call specifically so the very first real delivery can be used to verify
+// (or correct) these field names.
+const handleShiprocketWebhook = (req, res) => {
+  const expectedToken = process.env.SHIPROCKET_WEBHOOK_TOKEN;
+  if (expectedToken) {
+    const providedToken = req.headers['x-api-key'];
+    if (providedToken !== expectedToken) {
+      console.warn('[shiprocket webhook] rejected: token mismatch');
+      return res.status(401).json({ message: 'Invalid webhook token' });
+    }
+  }
+
+  const body = req.body || {};
+  console.log('[shiprocket webhook] received', JSON.stringify(body));
+
+  // Ack immediately, same reasoning as the Razorpay handler above.
+  res.status(200).json({ received: true });
+
+  processShiprocketWebhook(body).catch((err) => {
+    console.error('[shiprocket webhook] processing failed', err);
+  });
+};
+
+async function processShiprocketWebhook(body) {
+  const awb = body.awb || body.awb_code;
+  const shiprocketOrderId = body.order_id != null ? String(body.order_id) : body.sr_order_id != null ? String(body.sr_order_id) : undefined;
+  const shiprocketShipmentId = body.shipment_id != null ? String(body.shipment_id) : undefined;
+  const status = body.current_status || body.shipment_status || body.status;
+
+  if (!awb && !shiprocketOrderId && !shiprocketShipmentId) {
+    console.warn('[shiprocket webhook] payload has no recognizable identifier, ignoring', body);
+    return;
+  }
+
+  const orConditions = [];
+  if (awb) orConditions.push({ 'items.shipment.awbNumber': awb });
+  if (shiprocketOrderId) orConditions.push({ 'items.shipment.shiprocketOrderId': shiprocketOrderId });
+  if (shiprocketShipmentId) orConditions.push({ 'items.shipment.shiprocketShipmentId': shiprocketShipmentId });
+
+  const order = await Order.findOne({ $or: orConditions });
+  if (!order) {
+    console.warn('[shiprocket webhook] no matching order for', { awb, shiprocketOrderId, shiprocketShipmentId });
+    return;
+  }
+
+  let touched = false;
+  order.items.forEach((item) => {
+    const matches =
+      (awb && item.shipment?.awbNumber === awb) ||
+      (shiprocketOrderId && item.shipment?.shiprocketOrderId === shiprocketOrderId) ||
+      (shiprocketShipmentId && item.shipment?.shiprocketShipmentId === shiprocketShipmentId);
+    if (!matches) return;
+
+    item.shipment = item.shipment || {};
+    item.shipment.courierStatus = status;
+    if (awb && !item.shipment.awbNumber) item.shipment.awbNumber = awb;
+
+    const normalized = (status || '').toLowerCase();
+    if (normalized.includes('delivered')) {
+      item.shipment.shipmentStatus = 'delivered';
+      item.shipment.deliveredAt = item.shipment.deliveredAt || new Date();
+      if (!TERMINAL_ITEM_STATUSES.includes(item.itemStatus)) item.itemStatus = 'delivered';
+    } else if (normalized.includes('out for delivery') || normalized.includes('transit')) {
+      item.shipment.shipmentStatus = 'in_transit';
+    } else if (normalized.includes('rto') && normalized.includes('deliver')) {
+      item.shipment.shipmentStatus = 'rto_delivered';
+    } else if (normalized.includes('rto')) {
+      item.shipment.shipmentStatus = 'rto_initiated';
+    }
+
+    touched = true;
+  });
+
+  if (!touched) return;
+
+  recalcOrderStatus(order);
+  maybeStartReturnWindow(order);
+  await order.save();
+
+  console.log(`[shiprocket webhook] order ${order.orderNumber} updated: courierStatus="${status}"`);
+}
+
+module.exports = { handleRazorpayWebhook, handleShiprocketWebhook };
