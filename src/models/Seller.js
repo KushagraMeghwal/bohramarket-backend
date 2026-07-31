@@ -29,6 +29,7 @@ const sellerSchema = new mongoose.Schema(
     },
     gstNumber: { type: String, trim: true },
     panNumber: { type: String, trim: true },
+    aadhaarNumber: { type: String, trim: true },
     contactPhone: { type: String, required: true },
     pickupAddress: {
       line1: { type: String, required: true },

@@ -135,4 +135,25 @@ const getMe = asyncHandler(async (req, res) => {
   res.json({ user: await serializeUser(req.user) });
 });
 
-module.exports = { register, login, googleAuth, logout, getMe };
+// PATCH /api/auth/me — name/phone only. Email is deliberately not editable
+// here: it's the login identity (and unique-indexed), changing it needs its
+// own verification flow which doesn't exist yet, so that's out of scope.
+const updateMe = asyncHandler(async (req, res) => {
+  const { name, phone } = req.body;
+
+  if (name !== undefined) {
+    if (!name.trim()) {
+      return res.status(400).json({ message: 'Name cannot be empty' });
+    }
+    req.user.name = name.trim();
+  }
+
+  if (phone !== undefined) {
+    req.user.phone = phone.trim();
+  }
+
+  await req.user.save();
+  res.json({ user: await serializeUser(req.user) });
+});
+
+module.exports = { register, login, googleAuth, logout, getMe, updateMe };

@@ -24,26 +24,33 @@ const applySeller = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'A seller application already exists for this account' });
   }
 
-  const { businessName, businessType, gstNumber, panNumber, contactPhone, pickupAddress, bankDetails } = req.body;
+  const { businessName, businessType, gstNumber, panNumber, aadhaarNumber, contactPhone, pickupAddress, bankDetails } = req.body;
 
   if (!businessName || !contactPhone || !pickupAddress) {
     return res.status(400).json({ message: 'Missing required business details' });
   }
 
-  const documents = [];
-  if (req.files) {
-    Object.entries(req.files).forEach(([fieldName, files]) => {
-      files.forEach((file) => {
-        documents.push({ type: fieldName, url: file.path, publicId: file.filename });
-      });
-    });
+  // Every applicant proves identity (PAN + Aadhaar) and a business/bank
+  // proof — no optional-vs-mandatory distinction, all three are required.
+  const REQUIRED_DOCUMENT_FIELDS = ['pan', 'aadhaar', 'bank_proof'];
+  const missingDocuments = REQUIRED_DOCUMENT_FIELDS.filter((field) => !req.files?.[field]?.length);
+  if (missingDocuments.length) {
+    return res.status(400).json({ message: `Missing required documents: ${missingDocuments.join(', ')}` });
   }
+
+  const documents = [];
+  Object.entries(req.files).forEach(([fieldName, files]) => {
+    files.forEach((file) => {
+      documents.push({ type: fieldName, url: file.path, publicId: file.filename });
+    });
+  });
 
   const fields = {
     businessName,
     businessType,
     gstNumber,
     panNumber,
+    aadhaarNumber,
     contactPhone,
     pickupAddress: parseIfJson(pickupAddress),
     bankDetails: parseIfJson(bankDetails),
