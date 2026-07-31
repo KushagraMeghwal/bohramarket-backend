@@ -68,7 +68,16 @@ app.use('/api/site-content', siteContentRoutes);
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 
 app.use((err, req, res, next) => {
-  console.error(`[${req.method} ${req.originalUrl}]`, err);
+  // Cloudinary/network errors are sometimes plain objects rather than Error
+  // instances, so console.error(err) alone can print as "{}" and hide the
+  // actual reason — log the fields we actually care about explicitly.
+  console.error(`[${req.method} ${req.originalUrl}]`, {
+    name: err?.name,
+    message: err?.message,
+    http_code: err?.http_code,
+    code: err?.code,
+    stack: err?.stack,
+  });
 
   if (err.name === 'MulterError') {
     return res.status(400).json({ message: err.message || 'File upload failed' });
