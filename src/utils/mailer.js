@@ -1,7 +1,13 @@
 const nodemailer = require('nodemailer');
 
+// Exposed so authController can decide whether to echo the OTP back in the
+// API response — safe to do only while no real SMTP is configured (i.e.
+// nothing is actually being emailed, so there's nothing to leak), and it
+// self-disables the moment real SMTP creds are added.
+const isConfigured = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+
 let transporter = null;
-if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+if (isConfigured) {
   transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT) || 587,
@@ -39,4 +45,4 @@ async function sendOtpEmail(to, otp) {
   });
 }
 
-module.exports = { sendMail, sendOtpEmail };
+module.exports = { sendMail, sendOtpEmail, isConfigured };

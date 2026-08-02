@@ -3,7 +3,7 @@ const Seller = require('../models/Seller');
 const asyncHandler = require('../utils/asyncHandler');
 const { generateToken, TOKEN_COOKIE_NAME, COOKIE_OPTIONS } = require('../utils/generateToken');
 const { verifyFirebaseIdToken } = require('../utils/verifyFirebaseToken');
-const { sendOtpEmail } = require('../utils/mailer');
+const { sendOtpEmail, isConfigured: isEmailConfigured } = require('../utils/mailer');
 
 const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -58,7 +58,16 @@ const register = asyncHandler(async (req, res) => {
   // No token/cookie yet — the account exists but can't log in until the OTP
   // is verified (see verifyOtp below), so the frontend must route straight
   // to the "enter the code we emailed you" step instead of into the app.
-  res.status(201).json({ pendingVerification: true, email: user.email, message: 'We sent a verification code to your email' });
+  // devOtp is only ever included while no real SMTP is configured — nothing
+  // is actually being emailed in that case, so there's nothing to leak, and
+  // it lets the verify page show the code directly for testing without
+  // needing Railway log access. It disappears the moment SMTP is set up.
+  res.status(201).json({
+    pendingVerification: true,
+    email: user.email,
+    message: 'We sent a verification code to your email',
+    ...(isEmailConfigured ? {} : { devOtp: otp }),
+  });
 });
 
 // POST /api/auth/verify-otp — completes registration (or a login blocked by
@@ -105,7 +114,10 @@ const resendOtp = asyncHandler(async (req, res) => {
   await user.save();
   await sendOtpEmail(user.email, otp);
 
-  res.json({ message: 'A new verification code has been sent' });
+  res.json({
+    message: 'A new verification code has been sent',
+    ...(isEmailConfigured ? {} : { devOtp: otp }),
+  });
 });
 
 // POST /api/auth/login
