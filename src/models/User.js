@@ -48,6 +48,13 @@ const userSchema = new mongoose.Schema(
     addresses: [addressSchema],
     wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
     isActive: { type: Boolean, default: true },
+    // Defaults to true (not false) so accounts created before this field
+    // existed, and accounts created any other way than the local-signup OTP
+    // flow (Google sign-in, seed scripts), are never retroactively locked
+    // out. `register` is the only place that explicitly sets this false.
+    isEmailVerified: { type: Boolean, default: true },
+    emailOtp: { type: String, select: false },
+    emailOtpExpires: { type: Date, select: false },
   },
   { timestamps: true }
 );
@@ -61,6 +68,17 @@ userSchema.methods.comparePassword = function comparePassword(candidate) {
   // Google-only accounts have no local password to compare against.
   if (!this.password) return Promise.resolve(false);
   return bcrypt.compare(candidate, this.password);
+};
+
+userSchema.methods.setEmailOtp = async function setEmailOtp(otp) {
+  this.emailOtp = await bcrypt.hash(otp, 10);
+  this.emailOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+};
+
+userSchema.methods.compareEmailOtp = function compareEmailOtp(candidate) {
+  if (!this.emailOtp || !this.emailOtpExpires) return Promise.resolve(false);
+  if (this.emailOtpExpires.getTime() < Date.now()) return Promise.resolve(false);
+  return bcrypt.compare(candidate, this.emailOtp);
 };
 
 module.exports = mongoose.model('User', userSchema);

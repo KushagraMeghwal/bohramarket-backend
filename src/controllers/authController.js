@@ -3,6 +3,9 @@ const Seller = require('../models/Seller');
 const asyncHandler = require('../utils/asyncHandler');
 const { generateToken, TOKEN_COOKIE_NAME, COOKIE_OPTIONS } = require('../utils/generateToken');
 const { verifyFirebaseIdToken } = require('../utils/verifyFirebaseToken');
+const { sendOtpEmail } = require('../utils/mailer');
+
+const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
 // The frontend's route guards decide where to send a seller (onboarding form,
 // pending-approval screen, or dashboard) based on this status, so it has to
@@ -45,11 +48,64 @@ const register = asyncHandler(async (req, res) => {
     return res.status(409).json({ message: 'Email already registered' });
   }
 
-  const user = await User.create({ name, email, password, phone, role: role || 'customer' });
+  const user = await User.create({ name, email, password, phone, role: role || 'customer', isEmailVerified: false });
+
+  const otp = generateOtp();
+  await user.setEmailOtp(otp);
+  await user.save();
+  await sendOtpEmail(user.email, otp);
+
+  // No token/cookie yet — the account exists but can't log in until the OTP
+  // is verified (see verifyOtp below), so the frontend must route straight
+  // to the "enter the code we emailed you" step instead of into the app.
+  res.status(201).json({ pendingVerification: true, email: user.email, message: 'We sent a verification code to your email' });
+});
+
+// POST /api/auth/verify-otp — completes registration (or a login blocked by
+// an unverified email) once the user supplies the code emailed to them.
+const verifyOtp = asyncHandler(async (req, res) => {
+  const { email, otp } = req.body;
+
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and OTP are required' });
+  }
+
+  const user = await User.findOne({ email }).select('+emailOtp +emailOtpExpires');
+  if (!user || !(await user.compareEmailOtp(otp))) {
+    return res.status(400).json({ message: 'Invalid or expired code' });
+  }
+
+  user.isEmailVerified = true;
+  user.emailOtp = undefined;
+  user.emailOtpExpires = undefined;
+  await user.save();
 
   const token = generateToken(res, user._id, user.role);
 
-  res.status(201).json({ user: await serializeUser(user), token });
+  res.json({ user: await serializeUser(user), token });
+});
+
+// POST /api/auth/resend-otp
+const resendOtp = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ message: 'Email is required' });
+  }
+
+  const user = await User.findOne({ email });
+  if (!user) {
+    return res.status(404).json({ message: 'No account found for this email' });
+  }
+  if (user.isEmailVerified) {
+    return res.status(400).json({ message: 'This email is already verified' });
+  }
+
+  const otp = generateOtp();
+  await user.setEmailOtp(otp);
+  await user.save();
+  await sendOtpEmail(user.email, otp);
+
+  res.json({ message: 'A new verification code has been sent' });
 });
 
 // POST /api/auth/login
@@ -67,6 +123,10 @@ const login = asyncHandler(async (req, res) => {
 
   if (!user.isActive) {
     return res.status(403).json({ message: 'Account suspended' });
+  }
+
+  if (!user.isEmailVerified) {
+    return res.status(403).json({ pendingVerification: true, email: user.email, message: 'Please verify your email to continue' });
   }
 
   const token = generateToken(res, user._id, user.role);
@@ -99,6 +159,8 @@ const googleAuth = asyncHandler(async (req, res) => {
   let user = await User.findOne({ email: decoded.email });
 
   if (!user) {
+    // Google already verified this email address, so there's no OTP step
+    // for these accounts — isEmailVerified keeps its schema default (true).
     user = await User.create({
       name: decoded.name || decoded.email.split('@')[0],
       email: decoded.email,
@@ -156,4 +218,4 @@ const updateMe = asyncHandler(async (req, res) => {
   res.json({ user: await serializeUser(req.user) });
 });
 
-module.exports = { register, login, googleAuth, logout, getMe, updateMe };
+module.exports = { register, login, verifyOtp, resendOtp, googleAuth, logout, getMe, updateMe };
