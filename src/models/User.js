@@ -55,6 +55,11 @@ const userSchema = new mongoose.Schema(
     isEmailVerified: { type: Boolean, default: true },
     emailOtp: { type: String, select: false },
     emailOtpExpires: { type: Date, select: false },
+    // Separate from emailOtp/emailOtpExpires above (registration verification)
+    // on purpose — a password-reset request and a pending email-verification
+    // must never overwrite or invalidate each other.
+    passwordResetOtp: { type: String, select: false },
+    passwordResetOtpExpires: { type: Date, select: false },
   },
   { timestamps: true }
 );
@@ -79,6 +84,17 @@ userSchema.methods.compareEmailOtp = function compareEmailOtp(candidate) {
   if (!this.emailOtp || !this.emailOtpExpires) return Promise.resolve(false);
   if (this.emailOtpExpires.getTime() < Date.now()) return Promise.resolve(false);
   return bcrypt.compare(candidate, this.emailOtp);
+};
+
+userSchema.methods.setPasswordResetOtp = async function setPasswordResetOtp(otp) {
+  this.passwordResetOtp = await bcrypt.hash(otp, 10);
+  this.passwordResetOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+};
+
+userSchema.methods.comparePasswordResetOtp = function comparePasswordResetOtp(candidate) {
+  if (!this.passwordResetOtp || !this.passwordResetOtpExpires) return Promise.resolve(false);
+  if (this.passwordResetOtpExpires.getTime() < Date.now()) return Promise.resolve(false);
+  return bcrypt.compare(candidate, this.passwordResetOtp);
 };
 
 module.exports = mongoose.model('User', userSchema);

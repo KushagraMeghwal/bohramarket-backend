@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 
 // POST /api/categories
 const createCategory = asyncHandler(async (req, res) => {
-  const { name, slug, description, parentCategory, sortOrder } = req.body;
+  const { name, slug, description, parentCategory, sortOrder, type } = req.body;
 
   if (!name || !slug) {
     return res.status(400).json({ message: 'Name and slug are required' });
@@ -17,6 +17,7 @@ const createCategory = asyncHandler(async (req, res) => {
     description,
     parentCategory: parentCategory || null,
     sortOrder,
+    type,
     image,
   });
 
@@ -52,7 +53,7 @@ const updateCategory = asyncHandler(async (req, res) => {
     return res.status(404).json({ message: 'Category not found' });
   }
 
-  const editableFields = ['name', 'slug', 'description', 'parentCategory', 'isActive', 'sortOrder'];
+  const editableFields = ['name', 'slug', 'description', 'parentCategory', 'isActive', 'sortOrder', 'type'];
   editableFields.forEach((field) => {
     if (req.body[field] === undefined) return;
     category[field] = field === 'parentCategory' ? req.body[field] || null : req.body[field];

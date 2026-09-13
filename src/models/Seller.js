@@ -39,10 +39,23 @@ const sellerSchema = new mongoose.Schema(
       pincode: { type: String, required: true },
       country: { type: String, default: 'India' },
     },
-    // Registered lazily the first time this seller ships an order — see
-    // shiprocket.service.js ensurePickupLocation(). Shiprocket's adhoc order
-    // API references pickup addresses by this nickname, not raw address fields.
+    // Registered on seller approval (sellerController.approveSeller) and
+    // re-registered whenever the pickup address changes (updateMyProfile) —
+    // see shiprocket.service.js ensurePickupLocation(). Shiprocket's adhoc
+    // order API references pickup addresses by this nickname, not raw
+    // address fields.
     shiprocketPickupLocationName: String,
+    // Lets the seller/admin UI show *why* a seller's shipments would fail
+    // before an order ever gets to them, instead of only surfacing the
+    // problem the first time a real order silently fails Shiprocket's
+    // /settings/company/addpickup call.
+    shiprocketPickupStatus: {
+      type: String,
+      enum: ['not_registered', 'registered', 'failed'],
+      default: 'not_registered',
+    },
+    shiprocketPickupError: String,
+    shiprocketPickupRegisteredAt: Date,
     bankDetails: {
       accountHolderName: String,
       accountNumber: String,

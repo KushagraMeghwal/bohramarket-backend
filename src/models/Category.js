@@ -22,6 +22,14 @@ const categorySchema = new mongoose.Schema(
     },
     isActive: { type: Boolean, default: true },
     sortOrder: { type: Number, default: 0 },
+    // Drives whether products in this category get a size selector (clothing/
+    // footwear/accessories) or not (food/other) on the product page and the
+    // seller product form.
+    type: {
+      type: String,
+      enum: ['clothing', 'footwear', 'accessories', 'food', 'other'],
+      default: 'other',
+    },
   },
   { timestamps: true }
 );

@@ -45,4 +45,20 @@ async function sendOtpEmail(to, otp) {
   });
 }
 
-module.exports = { sendMail, sendOtpEmail, isConfigured };
+async function sendPasswordResetOtpEmail(to, otp) {
+  await sendMail({
+    to,
+    subject: 'Reset your BohraMart password',
+    text: `Your BohraMart password reset code is ${otp}. It expires in 10 minutes. If you didn't request this, you can ignore this email.`,
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+        <h2 style="color: #1f7a4d;">Reset your password</h2>
+        <p>Your BohraMart password reset code is:</p>
+        <p style="font-size: 32px; font-weight: 700; letter-spacing: 6px;">${otp}</p>
+        <p style="color: #666;">This code expires in 10 minutes. If you didn't request this, you can safely ignore this email — your password won't change.</p>
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendMail, sendOtpEmail, sendPasswordResetOtpEmail, isConfigured };

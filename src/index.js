@@ -17,8 +17,25 @@ const homepageRoutes = require('./routes/homepageRoutes');
 const siteContentRoutes = require('./routes/siteContentRoutes');
 const addressRoutes = require('./routes/addressRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
+const sellerOrderActionRoutes = require('./routes/sellerOrderActionRoutes');
+const checkoutRoutes = require('./routes/checkoutRoutes');
+const shipmentJobQueue = require('./services/shipmentJobQueue.service');
+const sellerResponseWindow = require('./services/sellerResponseWindow.service');
+// Side-effecting require: registers every fulfillment-chain step handler
+// (ensure_pickup..generate_invoice) with shipmentJobQueue. Must be required
+// before startWorker() below processes anything, and before any request
+// can enqueue a job (sellerOrderActionController.acceptSellerItem).
+require('./services/fulfillment.service');
 
 connectDB();
+
+// Starts the in-process job-queue worker (retries Shiprocket fulfillment
+// steps on failure — see shipmentJobQueue.service.js).
+shipmentJobQueue.startWorker();
+
+// Auto-cancels order items a seller never responded to within the response
+// window (see sellerResponseWindow.service.js).
+sellerResponseWindow.startWorker();
 
 const app = express();
 
@@ -55,6 +72,8 @@ app.use(cookieParser());
 
 app.get('/', (req, res) => res.send('BohraMarket API running'));
 
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+
 app.use('/api/auth', authRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -66,6 +85,8 @@ app.use('/api/reviews', reviewRoutes);
 app.use('/api/homepage', homepageRoutes);
 app.use('/api/site-content', siteContentRoutes);
 app.use('/api/addresses', addressRoutes);
+app.use('/api/seller/orders', sellerOrderActionRoutes);
+app.use('/api/checkout', checkoutRoutes);
 
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 
@@ -110,4 +131,4 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));

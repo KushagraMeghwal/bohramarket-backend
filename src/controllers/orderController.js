@@ -7,13 +7,26 @@ const User = require('../models/User');
 const razorpay = require('../config/razorpay');
 const asyncHandler = require('../utils/asyncHandler');
 const { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus, maybeStartReturnWindow } = require('../utils/orderStatus');
-const { createShipmentForOrder } = require('../services/orderFulfillment.service');
 const shiprocketService = require('../services/shiprocket.service');
+const notificationService = require('../services/notification.service');
+const { computeShippingForCart, FLAT_SHIPPING_FEE: SHARED_FLAT_SHIPPING_FEE } = require('../services/shippingRate.service');
+const { computeShipmentDimensions } = require('../services/orderFulfillment.service');
+const { selectCourier } = require('../services/courierSelection.service');
+
+// Shared by both createOrder branches (COD and online) — every seller
+// represented in a freshly-placed order gets exactly one notification, even
+// if they have multiple items in it.
+function notifySellersOfNewOrder(order) {
+  const notified = new Set();
+  order.items.forEach((item) => {
+    const sellerId = String(item.seller);
+    if (notified.has(sellerId)) return;
+    notified.add(sellerId);
+    notificationService.notifySeller(sellerId, `New order item(s) awaiting your response — order ${order.orderNumber}`);
+  });
+}
 
 const generateOrderNumber = () => `BM${Date.now()}${Math.floor(Math.random() * 1000)}`;
-
-const FLAT_SHIPPING_FEE = 49;
-const FREE_SHIPPING_THRESHOLD = 999;
 
 // POST /api/orders
 // Recalculates every price server-side from the live Product documents —
@@ -74,6 +87,7 @@ const createOrder = asyncHandler(async (req, res) => {
       seller: product.seller,
       name: product.name,
       image: product.images?.[0]?.url,
+      size: product.attributes?.size || undefined,
       price,
       quantity: qty,
       subtotal,
@@ -86,8 +100,38 @@ const createOrder = asyncHandler(async (req, res) => {
   }
 
   // shippingFee/discount are derived server-side, never taken from the
-  // client, for the same reason item prices are recalculated above.
-  const shippingFee = itemsTotal >= FREE_SHIPPING_THRESHOLD ? 0 : FLAT_SHIPPING_FEE;
+  // client, for the same reason item prices are recalculated above (PART
+  // 2.9 — mirrors the checkout shipping-estimate endpoint's own
+  // computation, via the same shared function, so the two can't diverge).
+  //
+  // Deliberately lenient here even when computeShippingForCart reports a
+  // seller as genuinely unserviceable: hard-blocking order creation on that
+  // would be a new failure mode on the checkout critical path, and the
+  // fulfillment chain already has a safety net for exactly this case (PART
+  // 2.6 step 2 cancels+refunds the affected items once a seller accepts and
+  // serviceability is re-checked for real). The hard block the task asked
+  // for lives at the checkout-estimate step instead (checkoutController.js),
+  // which the frontend calls *before* letting the customer submit — this is
+  // the fallback path for a client that bypasses that step entirely.
+  const groupedBySeller = new Map();
+  orderItems.forEach((item) => {
+    const sellerId = String(item.seller);
+    if (!groupedBySeller.has(sellerId)) {
+      groupedBySeller.set(sellerId, { items: [], productById: new Map(), subtotal: 0 });
+    }
+    const group = groupedBySeller.get(sellerId);
+    group.items.push({ product: item.product, quantity: item.quantity, name: item.name });
+    group.productById.set(String(item.product), productMap.get(String(item.product)));
+    group.subtotal += item.subtotal;
+  });
+
+  const shippingResult = await computeShippingForCart({
+    groupedBySeller,
+    deliveryPincode: shippingAddress.pincode,
+    paymentMethod,
+    itemsTotal,
+  });
+  const shippingFee = shippingResult.serviceable ? shippingResult.shippingFee : SHARED_FLAT_SHIPPING_FEE;
   const discount = 0;
   const totalAmount = itemsTotal + shippingFee - discount;
   const orderNumber = generateOrderNumber();
@@ -146,28 +190,42 @@ const createOrder = asyncHandler(async (req, res) => {
     order.razorpay = { orderId: razorpayOrder.id };
     await order.save();
 
+    // PART 1's flow sends "Order placed" immediately on placement for both
+    // COD and prepaid — not gated on payment succeeding. Not awaited:
+    // sendSms never blocks/throws (see notification.service.js), but there's
+    // no reason to hold the response on it either way.
+    notificationService.sendSms({ to: shippingAddress.phone, templateKey: 'ORDER_PLACED', vars: { orderNumber: order.orderNumber } });
+    notifySellersOfNewOrder(order);
+
     return res.status(201).json({ order, razorpayOrder });
   }
 
-  // COD orders are "confirmed" the moment they're placed — there's no
-  // separate payment step to wait for the way there is for online orders
-  // (see verifyPayment / webhookController.handlePaymentCaptured). Not
-  // awaited: a Shiprocket outage shouldn't delay or fail order placement.
-  createShipmentForOrder(order);
+  // Items already default to sellerOrderStatus 'awaiting_seller' (see
+  // Order.js orderItemSchema) — no further state change needed here. What
+  // used to auto-fire Shiprocket fulfillment immediately on COD placement
+  // now waits for each seller to explicitly accept
+  // (sellerOrderActionController.acceptSellerItem), per the seller-
+  // acceptance flow.
+  notificationService.sendSms({ to: shippingAddress.phone, templateKey: 'ORDER_PLACED', vars: { orderNumber: order.orderNumber } });
+  notifySellersOfNewOrder(order);
 
   res.status(201).json({ order });
 });
 
 // GET /api/orders
 const getOrders = asyncHandler(async (req, res) => {
-  const { status, paymentStatus, dateFrom, dateTo, page = 1, limit = 20 } = req.query;
+  const { status, paymentStatus, dateFrom, dateTo, seller, page = 1, limit = 20 } = req.query;
   const filter = {};
 
   if (req.user.role === 'customer') {
     filter.customer = req.user._id;
   } else if (req.user.role === 'seller') {
-    const seller = await Seller.findOne({ user: req.user._id });
-    filter['items.seller'] = seller?._id;
+    const own = await Seller.findOne({ user: req.user._id });
+    filter['items.seller'] = own?._id;
+  } else if (seller) {
+    // Admin-only: drill into one seller's orders (see admin/orders' seller
+    // list — clicking a seller filters to just their orders).
+    filter['items.seller'] = seller;
   }
 
   if (status) filter.orderStatus = status;
@@ -185,6 +243,7 @@ const getOrders = asyncHandler(async (req, res) => {
   const [orders, total] = await Promise.all([
     Order.find(filter)
       .populate('customer', 'name email phone')
+      .populate('items.seller', 'businessName')
       .sort('-createdAt')
       .skip((pageNum - 1) * limitNum)
       .limit(limitNum),
@@ -331,11 +390,24 @@ const verifyPayment = asyncHandler(async (req, res) => {
   };
   await order.save();
 
-  // Not awaited — see createOrder's COD call for why. The Razorpay
-  // payment.captured webhook also calls this for the same order; the
-  // idempotency check inside createShipmentForOrder is what stops whichever
-  // of the two fires second from double-booking the shipment.
-  createShipmentForOrder(order);
+  // Same as createOrder's COD path: items are already 'awaiting_seller' by
+  // default, so payment confirmation alone doesn't trigger fulfillment
+  // anymore — the seller still has to explicitly accept. (The old
+  // createShipmentForOrder auto-fire, and its idempotency-via-duplicate-call
+  // concern with the Razorpay webhook, no longer applies now that nothing
+  // fires automatically here or from webhookController's payment.captured
+  // handler — see that handler's own comment.)
+  //
+  // Deliberately no SMS here: PART 1's flow has exactly two pre-shipping
+  // customer milestones — ORDER_PLACED (already sent at createOrder, for
+  // both COD and online) and ORDER_CONFIRMED / "confirmed, shipping soon"
+  // (sent once fulfillment actually completes — fulfillment.service.js's
+  // stepGenerateInvoice). Payment succeeding is an internal state change
+  // between those two, not its own listed milestone — sending a third SMS
+  // here would be the "spam every state change" this design is avoiding.
+  // Sellers whose items were blocked from accepting by the payment-pending
+  // guard (acceptSellerItem) ARE notified now, though — see the webhook
+  // handler's own payment.captured comment.
 
   res.json({ order });
 });
@@ -512,16 +584,69 @@ const requestReturn = asyncHandler(async (req, res) => {
   }).select('email');
   const sellerEmailByUserId = new Map(sellerUsers.map((u) => [String(u._id), u.email]));
 
+  const products = await Product.find({ _id: { $in: order.items.map((item) => item.product) } }).select('name weight dimensions');
+  const productById = new Map(products.map((p) => [String(p._id), p]));
+
+  // PART 2.11 pass 1: check reverse serviceability for every seller *before*
+  // creating anything — a partial return (some sellers' packages picked up,
+  // others silently failing mid-loop) is worse than telling the customer up
+  // front which items can't be returned.
+  const groupsBySellerId = new Map();
+  const unserviceableProductNames = [];
+
   for (const sellerId of sellerIds) {
     const groupItems = order.items.filter((item) => String(item.seller?._id || item.seller) === sellerId);
     const seller = groupItems[0].seller;
     if (!seller || typeof seller === 'string') {
       console.warn(`[shiprocket] return for order ${order.orderNumber}: seller ${sellerId} not populated, skipping`);
+      groupItems.forEach((item) => unserviceableProductNames.push(item.name));
       continue;
     }
 
+    const dimensions = computeShipmentDimensions(
+      groupItems.map((item) => ({ product: item.product, quantity: item.quantity, name: item.name })),
+      productById
+    );
+    const declaredValue = groupItems.reduce((sum, item) => sum + item.subtotal, 0);
+
     try {
-      await shiprocketService.requestReturn({
+      const result = await shiprocketService.checkReturnServiceability({
+        customerPincode: order.shippingAddress.pincode,
+        sellerPincode: seller.pickupAddress.pincode,
+        weight: dimensions.weight,
+        declaredValue,
+      });
+      const couriers = result?.data?.available_courier_companies || [];
+      const chosen = selectCourier(couriers, { paymentMethod: 'online' }); // returns are never COD — no cod-support filter needed
+
+      if (!chosen) {
+        groupItems.forEach((item) => unserviceableProductNames.push(item.name));
+        continue;
+      }
+
+      groupsBySellerId.set(sellerId, { seller, groupItems, courierId: chosen.courierId, declaredValue });
+    } catch (err) {
+      // A Shiprocket outage here shouldn't block the return request outright
+      // (rule 3) — fall back to attempting the return without a
+      // pre-selected courier (Shiprocket auto-assigns one) rather than
+      // treating a serviceability-check hiccup as "unserviceable".
+      console.error(`[shiprocket] return serviceability check failed for order ${order.orderNumber}, seller ${sellerId}, proceeding without a pre-selected courier: ${err.message || err}`);
+      groupsBySellerId.set(sellerId, { seller, groupItems, courierId: undefined, declaredValue });
+    }
+  }
+
+  if (unserviceableProductNames.length > 0) {
+    return res.status(422).json({
+      message: `These items can't currently be picked up for return: ${unserviceableProductNames.join(', ')}`,
+      unserviceableProductNames,
+    });
+  }
+
+  // PART 2.11 pass 2: create the return order + assign a return AWB for
+  // each seller now that every group is known serviceable.
+  for (const [sellerId, { seller, groupItems, courierId }] of groupsBySellerId) {
+    try {
+      const response = await shiprocketService.requestReturn({
         orderNumber: order.orderNumber,
         orderDate: order.createdAt,
         customer: { name: order.shippingAddress.fullName, phone: order.shippingAddress.phone, email: req.user.email },
@@ -533,6 +658,42 @@ const requestReturn = asyncHandler(async (req, res) => {
         items: groupItems.map((item) => ({ name: item.name, sku: String(item.product), quantity: item.quantity, price: item.price })),
         subTotal: groupItems.reduce((sum, item) => sum + item.subtotal, 0),
       });
+
+      const returnOrderId = response?.order_id != null ? String(response.order_id) : undefined;
+      const returnShipmentId = response?.shipment_id != null ? String(response.shipment_id) : undefined;
+
+      let returnAwb;
+      if (returnShipmentId) {
+        try {
+          const awbResponse = await shiprocketService.assignAwb({ shipmentId: returnShipmentId, courierId });
+          const data = awbResponse?.response?.data || awbResponse?.data || awbResponse;
+          returnAwb = data?.awb_code ? String(data.awb_code) : undefined;
+        } catch (err) {
+          // Return order itself was already created successfully — an AWB
+          // assignment hiccup shouldn't fail the whole return, just means
+          // the pickup AWB isn't known yet (Shiprocket may still assign one
+          // on their side; the tracking webhook will pick it up later).
+          console.error(`[shiprocket] return AWB assignment failed for order ${order.orderNumber}, seller ${sellerId}: ${err.message || err}`);
+        }
+      }
+
+      groupItems.forEach((item) => {
+        item.returnShipment = item.returnShipment || {};
+        item.returnShipment.shiprocketOrderId = returnOrderId;
+        item.returnShipment.shiprocketShipmentId = returnShipmentId;
+        if (returnAwb) item.returnShipment.awbNumber = returnAwb;
+        item.sellerOrderStatus = 'return_requested';
+        item.statusHistory = item.statusHistory || [];
+        item.statusHistory.push({ status: 'return_requested', source: 'system', at: new Date() });
+      });
+
+      notificationService.notifySeller(sellerId, `A return has been requested for order ${order.orderNumber} — pickup will be arranged.`);
+
+      notificationService.sendSms({
+        to: order.shippingAddress.phone,
+        templateKey: 'RETURN_INITIATED',
+        vars: { orderNumber: order.orderNumber, returnAwbNumber: returnAwb },
+      });
     } catch (err) {
       console.error(`[shiprocket] return request failed for order ${order.orderNumber}, seller ${sellerId}`, err);
       return res.status(502).json({ message: 'Could not initiate the return with our courier partner. Please try again shortly.' });
@@ -541,6 +702,8 @@ const requestReturn = asyncHandler(async (req, res) => {
 
   order.returnStatus = 'requested';
   await order.save();
+
+  notificationService.notifyAdmin(`Return requested for order ${order.orderNumber}`);
 
   res.json({ order });
 });

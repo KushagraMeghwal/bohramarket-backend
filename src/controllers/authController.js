@@ -3,7 +3,7 @@ const Seller = require('../models/Seller');
 const asyncHandler = require('../utils/asyncHandler');
 const { generateToken, TOKEN_COOKIE_NAME, COOKIE_OPTIONS } = require('../utils/generateToken');
 const { verifyFirebaseIdToken } = require('../utils/verifyFirebaseToken');
-const { sendOtpEmail, isConfigured: isEmailConfigured } = require('../utils/mailer');
+const { sendOtpEmail, sendPasswordResetOtpEmail, isConfigured: isEmailConfigured } = require('../utils/mailer');
 
 const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -198,6 +198,59 @@ const googleAuth = asyncHandler(async (req, res) => {
   res.json({ user: await serializeUser(user), token });
 });
 
+// POST /api/auth/forgot-password
+// Body: { email }. Always responds with the same generic message regardless
+// of whether the account exists (or is Google-only, which has no local
+// password to reset) — revealing which emails have accounts here is a real
+// enumeration risk, unlike resend-otp above (that's mid-registration, where
+// the caller already knows the account was just created).
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ message: 'Email is required' });
+  }
+
+  const user = await User.findOne({ email });
+  let devOtp;
+
+  if (user && user.authProvider !== 'google') {
+    const otp = generateOtp();
+    await user.setPasswordResetOtp(otp);
+    await user.save();
+    await sendPasswordResetOtpEmail(user.email, otp);
+    if (!isEmailConfigured) devOtp = otp;
+  }
+
+  res.json({
+    message: 'If an account exists for this email, a reset code has been sent.',
+    ...(devOtp ? { devOtp } : {}),
+  });
+});
+
+// POST /api/auth/reset-password
+// Body: { email, otp, newPassword }
+const resetPassword = asyncHandler(async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  if (!email || !otp || !newPassword) {
+    return res.status(400).json({ message: 'Email, code and new password are required' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  }
+
+  const user = await User.findOne({ email }).select('+passwordResetOtp +passwordResetOtpExpires');
+  if (!user || !(await user.comparePasswordResetOtp(otp))) {
+    return res.status(400).json({ message: 'Invalid or expired code' });
+  }
+
+  user.password = newPassword; // pre('save') hashes it
+  user.passwordResetOtp = undefined;
+  user.passwordResetOtpExpires = undefined;
+  await user.save();
+
+  res.json({ message: 'Password updated. You can now log in with your new password.' });
+});
+
 // POST /api/auth/logout
 const logout = (req, res) => {
   res.clearCookie(TOKEN_COOKIE_NAME, COOKIE_OPTIONS);
@@ -230,4 +283,4 @@ const updateMe = asyncHandler(async (req, res) => {
   res.json({ user: await serializeUser(req.user) });
 });
 
-module.exports = { register, login, verifyOtp, resendOtp, googleAuth, logout, getMe, updateMe };
+module.exports = { register, login, verifyOtp, resendOtp, googleAuth, logout, getMe, updateMe, forgotPassword, resetPassword };

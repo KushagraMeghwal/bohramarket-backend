@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+.env
+.env.example
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+*.log
+tmp-test-doc.pdf
+scripts
+seed-demo-data.js
+cloudinary-onboarding.js

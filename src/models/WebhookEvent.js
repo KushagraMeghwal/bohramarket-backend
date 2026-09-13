@@ -6,7 +6,15 @@ const mongoose = require('mongoose');
 // retries of the same delivery.
 const webhookEventSchema = new mongoose.Schema(
   {
-    razorpayEventId: { type: String, required: true, unique: true },
+    // sparse (not required) so a Shiprocket-only document can omit this —
+    // Razorpay's own handler still always sets it, unchanged.
+    razorpayEventId: { type: String, unique: true, sparse: true },
+    // Dedupe key for a Shiprocket webhook delivery — see
+    // webhookController.js's shiprocketDedupeKey(). A separate field (not a
+    // reuse/rename of razorpayEventId) so both webhook sources share this
+    // one idempotency table without either one's key format constraining
+    // the other.
+    shiprocketEventId: { type: String, unique: true, sparse: true },
     eventType: { type: String, required: true },
     processedAt: { type: Date, default: Date.now },
   },

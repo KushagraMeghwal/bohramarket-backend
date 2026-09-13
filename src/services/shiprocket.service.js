@@ -66,7 +66,18 @@ async function rawRequest(path, { method = 'GET', body, token }) {
 // exactly once rather than failing the caller outright.
 async function shiprocketFetch(path, options = {}) {
   const token = await getToken();
-  let { res, data } = await rawRequest(path, { ...options, token });
+
+  let res, data;
+  try {
+    ({ res, data } = await rawRequest(path, { ...options, token }));
+  } catch (err) {
+    // fetch() itself threw — DNS/connection/timeout, not an HTTP error
+    // response. Tagged isNetworkError so shiprocketRetry.service.js can tell
+    // this apart from a real 4xx/5xx without parsing the message string.
+    const networkErr = new Error(`Shiprocket ${options.method || 'GET'} ${path} network error: ${err.message}`);
+    networkErr.isNetworkError = true;
+    throw networkErr;
+  }
 
   if (res.status === 401) {
     cachedToken = null;
@@ -75,10 +86,50 @@ async function shiprocketFetch(path, options = {}) {
   }
 
   if (!res.ok) {
-    throw new Error(`Shiprocket ${options.method || 'GET'} ${path} failed (${res.status}): ${JSON.stringify(data)}`);
+    // .status is additive — existing callers that only read err.message are
+    // unaffected; shiprocketRetry.service.js uses .status to decide whether
+    // a failure is worth retrying (5xx) or not (4xx — retrying an identical
+    // bad request just reproduces the same error).
+    const httpErr = new Error(`Shiprocket ${options.method || 'GET'} ${path} failed (${res.status}): ${JSON.stringify(data)}`);
+    httpErr.status = res.status;
+    // The raw parsed JSON body, kept alongside the stringified .message so
+    // callers that need field-level detail (see parseShiprocketError below)
+    // don't have to re-parse it back out of the message string.
+    httpErr.responseBody = data;
+    throw httpErr;
   }
 
   return data;
+}
+
+// Shiprocket's validation errors come back one level double-encoded: the
+// response body is JSON, but its own `message` field is itself a
+// JSON-stringified object of {field: [messages]} — e.g.
+// {"message":"{\"address\":[\"Address line 1 should have House no / Flat no
+// / Road no.\"]}","status_code":422}. This unwraps that into a clean
+// {field, message} pair (or falls back to a plain message when the body
+// isn't shaped this way — a network error, a 5xx with no JSON body, etc.).
+function parseShiprocketError(err) {
+  const rawMessage = err?.responseBody?.message;
+
+  if (typeof rawMessage === 'string') {
+    try {
+      const parsed = JSON.parse(rawMessage);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const [field] = Object.keys(parsed);
+        if (field) {
+          const fieldMessages = parsed[field];
+          const message = Array.isArray(fieldMessages) ? fieldMessages[0] : String(fieldMessages);
+          if (message) return { field, message };
+        }
+      }
+    } catch {
+      // rawMessage wasn't JSON — it's already a plain human-readable string.
+      return { field: null, message: rawMessage };
+    }
+  }
+
+  return { field: null, message: err?.message || 'Shiprocket rejected this request.' };
 }
 
 // Registers a seller's pickup address as a named pickup location under our
@@ -115,10 +166,16 @@ async function ensurePickupLocation(seller, sellerEmail) {
       },
     });
   } catch (err) {
-    // Shiprocket returns a 422-ish "pickup location already exists" if the
-    // nickname was already registered (e.g. a retried request) — that's a
-    // success for our purposes, not a failure.
-    if (!/already exists/i.test(err.message)) {
+    // Shiprocket returns a 422 with a "pickup location already exists"
+    // message if the nickname was already registered (e.g. a retried
+    // request) — that's a success for our purposes, not a failure. Checked
+    // narrowly (specific status code + message mentioning both "pickup
+    // location" and "already exists", not a bare "already exists" substring
+    // anywhere in the response) so an unrelated validation error that
+    // happens to contain similar wording elsewhere in the payload isn't
+    // silently swallowed as a false "success" (PART 2.10 hardening).
+    const isPickupLocationConflict = err.status === 422 && /pickup\s*location/i.test(err.message) && /already\s*exists/i.test(err.message);
+    if (!isPickupLocationConflict) {
       throw err;
     }
   }
@@ -136,8 +193,17 @@ async function ensurePickupLocation(seller, sellerEmail) {
 // must call this once per seller — see orderFulfillment.service.js, which
 // does that grouping before calling in here.
 async function createShipmentOrder(order) {
+  // No silent fallback here on purpose — every real caller (see
+  // orderFulfillment.service.js computeShipmentDimensions) is expected to
+  // compute real dimensions from the order's products before calling in. A
+  // missing order.dimensions is a caller bug, not something to paper over
+  // with a made-up box size that would silently misprice every shipment.
+  if (!order.dimensions) {
+    throw new Error('createShipmentOrder: order.dimensions is required (no fallback — compute it from product weight/dimensions before calling)');
+  }
+
   const [firstName, ...rest] = order.customer.name.trim().split(' ');
-  const dims = order.dimensions || { length: 20, breadth: 15, height: 10, weight: 0.5 };
+  const dims = order.dimensions;
 
   const payload = {
     order_id: order.orderNumber,
@@ -177,6 +243,92 @@ async function cancelShipmentOrder(shiprocketOrderId) {
 
 async function trackShipment(shipmentId) {
   return shiprocketFetch(`/courier/track/shipment/${shipmentId}`, { method: 'GET' });
+}
+
+async function trackByAwb(awb) {
+  return shiprocketFetch(`/courier/track/awb/${awb}`, { method: 'GET' });
+}
+
+// NOTE: field names for every function below (through generateManifest) are
+// transcribed from Shiprocket's public API reference docs, the same way the
+// original requestReturn() above was — none of them have been exercised
+// against a live Shiprocket account in this change. Verify the exact
+// request/response shape against a real call (or current docs) before
+// depending on any field not already covered by createShipmentOrder/
+// cancelShipmentOrder/trackShipment, which *have* been exercised live.
+
+// pickupPincode/deliveryPincode: 6-digit strings. weight: kg (Number). cod:
+// boolean (order.paymentMethod === 'COD'). declaredValue: order subtotal, used
+// by Shiprocket for insurance/COD-limit checks — optional.
+// Response shape (per docs): { data: { available_courier_companies: [
+//   { courier_company_id, courier_name, rate, cod, etd (days or date string),
+//     rating, ... } ], recommended_courier_company_id } }
+// courierSelection.service.js (PART 3) reads available_courier_companies.
+async function checkServiceability({ pickupPincode, deliveryPincode, weight, cod, declaredValue }) {
+  const params = new URLSearchParams({
+    pickup_postcode: String(pickupPincode),
+    delivery_postcode: String(deliveryPincode),
+    weight: String(weight),
+    cod: cod ? '1' : '0',
+  });
+  if (declaredValue != null) params.set('declared_value', String(declaredValue));
+
+  return shiprocketFetch(`/courier/serviceability/?${params.toString()}`, { method: 'GET' });
+}
+
+// Reverse pickup (return) serviceability is not a separate Shiprocket
+// endpoint as far as the public docs describe — it's the same
+// /courier/serviceability/ call with pickup/delivery swapped (the customer's
+// address becomes the pickup point, the seller's warehouse becomes delivery).
+async function checkReturnServiceability({ customerPincode, sellerPincode, weight, declaredValue }) {
+  return checkServiceability({
+    pickupPincode: customerPincode,
+    deliveryPincode: sellerPincode,
+    weight,
+    cod: false, // returns are never COD
+    declaredValue,
+  });
+}
+
+// courierId omitted lets Shiprocket auto-assign its recommended courier;
+// pass it to force a specific one (see courierSelection.service.js).
+// Response shape (per docs): { response: { data: { awb_code, courier_name,
+//   courier_company_id, ... } } } — read defensively by the caller since
+// this hasn't been verified live.
+async function assignAwb({ shipmentId, courierId }) {
+  const body = { shipment_id: shipmentId };
+  if (courierId != null) body.courier_id = courierId;
+  return shiprocketFetch('/courier/assign/awb', { method: 'POST', body });
+}
+
+// Response shape (per docs): { pickup_status, response: { pickup_scheduled_date,
+//   pickup_token_number, ... } }
+async function requestPickup({ shipmentId }) {
+  return shiprocketFetch('/courier/generate/pickup', { method: 'POST', body: { shipment_id: [shipmentId] } });
+}
+
+// shipmentIds: array — Shiprocket supports generating one label PDF covering
+// multiple shipments, but callers here always pass a single-element array
+// (one label per seller's shipment) to keep the label 1:1 with our own
+// shipment record. Response shape (per docs): { label_created, label_url }.
+async function generateLabel({ shipmentIds }) {
+  return shiprocketFetch('/courier/generate/label', { method: 'POST', body: { shipment_id: shipmentIds } });
+}
+
+// orderIds here are Shiprocket's own numeric order ids (the `order_id` a
+// createShipmentOrder response returns), NOT our orderNumber string.
+// Response shape (per docs): { is_invoice_created, invoice_url }.
+async function generateInvoice({ orderIds }) {
+  return shiprocketFetch('/orders/print/invoice', { method: 'POST', body: { ids: orderIds } });
+}
+
+// LOWER CONFIDENCE than the functions above — the exact response shape for
+// manifest generation (whether it returns a direct URL or a token you poll)
+// is not clearly documented publicly. Treat generateManifest's return value
+// as opaque until confirmed against a real call; do not assume a
+// `manifest_url` field exists without checking the actual response first.
+async function generateManifest({ shipmentIds }) {
+  return shiprocketFetch('/manifests/generate', { method: 'POST', body: { shipment_id: shipmentIds } });
 }
 
 // items: [{ sku, name, quantity, price }] — the items from the order being returned.
@@ -247,9 +399,18 @@ async function requestReturn({
 
 module.exports = {
   getToken,
+  parseShiprocketError,
   ensurePickupLocation,
   createShipmentOrder,
   cancelShipmentOrder,
   trackShipment,
+  trackByAwb,
   requestReturn,
+  checkServiceability,
+  checkReturnServiceability,
+  assignAwb,
+  requestPickup,
+  generateLabel,
+  generateInvoice,
+  generateManifest,
 };

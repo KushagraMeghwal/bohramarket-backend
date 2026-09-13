@@ -2,6 +2,7 @@ const User = require('../models/User');
 const Seller = require('../models/Seller');
 const Order = require('../models/Order');
 const asyncHandler = require('../utils/asyncHandler');
+const { registerShiprocketPickup } = require('../services/sellerPickupRegistration.service');
 
 const COMMISSION_PERCENT = Number(process.env.PLATFORM_COMMISSION_PERCENT) || 0;
 
@@ -100,6 +101,86 @@ const getSellerById = asyncHandler(async (req, res) => {
   res.json({ seller });
 });
 
+// PATCH /api/sellers/me
+// Lets an already-onboarded seller edit their editable business details.
+// GST/PAN/Aadhaar/documents/status are intentionally excluded — those are
+// KYC-verified fields and changing them here would bypass admin review.
+const updateMyProfile = asyncHandler(async (req, res) => {
+  const seller = await Seller.findOne({ user: req.user._id });
+  if (!seller) {
+    return res.status(404).json({ message: 'Seller profile not found' });
+  }
+
+  const { businessName, contactPhone, pickupAddress, bankDetails } = req.body;
+
+  if (!businessName || !contactPhone || !pickupAddress) {
+    return res.status(400).json({ message: 'Missing required business details' });
+  }
+
+  const newPickupAddress = parseIfJson(pickupAddress);
+  const oldPickupAddress = seller.pickupAddress?.toObject ? seller.pickupAddress.toObject() : seller.pickupAddress;
+  const pickupAddressChanged = JSON.stringify(oldPickupAddress) !== JSON.stringify(newPickupAddress);
+
+  seller.businessName = businessName;
+  seller.contactPhone = contactPhone;
+  seller.pickupAddress = newPickupAddress;
+  if (bankDetails) seller.bankDetails = parseIfJson(bankDetails);
+
+  if (pickupAddressChanged) {
+    // The old Shiprocket pickup location (registered off the *previous*
+    // address — see shiprocket.service.js ensurePickupLocation()) no longer
+    // matches. PART 2.10: instead of just clearing it and leaving the
+    // seller to discover whether the new address works only when their next
+    // order silently fails, register fresh against the new address right
+    // now and report the result.
+    seller.shiprocketPickupLocationName = undefined;
+    seller.shiprocketPickupStatus = 'not_registered';
+    await seller.save();
+    await registerShiprocketPickup(seller);
+  } else {
+    await seller.save();
+  }
+
+  res.json({ seller });
+});
+
+// POST /api/sellers/me/retry-pickup-registration
+// Manual retry for the "Failed" pickup-registration badge on the seller's
+// own profile page — same underlying function the automatic paths use
+// (approval, address change, first accepted order), just triggered on
+// demand instead of by one of those events.
+const retryPickupRegistration = asyncHandler(async (req, res) => {
+  const seller = await Seller.findOne({ user: req.user._id });
+  if (!seller) {
+    return res.status(404).json({ message: 'Seller profile not found' });
+  }
+
+  let result;
+  try {
+    result = await registerShiprocketPickup(seller);
+  } catch (err) {
+    // registerShiprocketPickup is designed to never throw — it catches every
+    // Shiprocket/network failure itself and returns {success: false, ...}
+    // (see sellerPickupRegistration.service.js). This is a defensive
+    // backstop only, so a future change there can never turn into an
+    // unhandled rejection reaching asyncHandler as a bare 500/502.
+    console.error(`[retry-pickup-registration] unexpected error for seller ${seller._id}:`, err);
+    return res.status(500).json({ message: 'Could not retry pickup registration. Please try again.' });
+  }
+
+  if (!result.success) {
+    // A rejected address is a client-fixable validation problem (bad/
+    // incomplete pickup address), not an upstream gateway failure — 502
+    // told the frontend "something's broken on our end" when the real
+    // answer is "fix this field". 422 when a specific field was identified,
+    // 400 for a less structured Shiprocket rejection.
+    const status = result.field ? 422 : 400;
+    return res.status(status).json({ message: result.error, field: result.field ?? null, seller });
+  }
+
+  res.json({ seller });
+});
+
 // PATCH /api/sellers/:id/approve
 const approveSeller = asyncHandler(async (req, res) => {
   const seller = await Seller.findByIdAndUpdate(
@@ -116,6 +197,15 @@ const approveSeller = asyncHandler(async (req, res) => {
   if (!seller) {
     return res.status(404).json({ message: 'Seller not found' });
   }
+
+  // PART 2.10: register the Shiprocket pickup location now, not lazily on
+  // the seller's first order — surfaces a broken pickup address (bad
+  // address data, Shiprocket account issue) while an admin is already
+  // looking at this seller in the approval flow, instead of it silently
+  // failing days later on a real customer order. Never blocks the approval
+  // response either way — registerShiprocketPickup handles its own
+  // success/failure bookkeeping and notification.
+  await registerShiprocketPickup(seller);
 
   res.json({ seller });
 });
@@ -263,6 +353,8 @@ module.exports = {
   applySeller,
   getSellers,
   getMySellerProfile,
+  updateMyProfile,
+  retryPickupRegistration,
   getSellerById,
   approveSeller,
   rejectSeller,

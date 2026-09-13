@@ -8,6 +8,19 @@ const slugify = (name) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '');
 
+// multipart/form-data (used for image uploads) sends every field as a plain
+// string, so nested-object fields like `attributes`/`dimensions` arrive
+// JSON-stringified from the seller form and need parsing before Mongoose
+// can cast them into the schema's embedded objects.
+const parseIfJson = (value) => {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    return value;
+  }
+};
+
 // POST /api/products (requireApprovedSeller middleware already gated this)
 const createProduct = asyncHandler(async (req, res) => {
   const {
@@ -42,9 +55,9 @@ const createProduct = asyncHandler(async (req, res) => {
     sku,
     stock,
     variantGroupId,
-    attributes,
+    attributes: parseIfJson(attributes),
     weight,
-    dimensions,
+    dimensions: parseIfJson(dimensions),
     status: 'pending_review',
   });
 
@@ -60,14 +73,18 @@ const SORT_OPTIONS = {
 
 // GET /api/products
 const getProducts = asyncHandler(async (req, res) => {
-  const { category, status, seller, search, variantGroupId, minPrice, maxPrice, minRating, sort, page = 1, limit = 20 } =
+  const { category, status, seller, search, variantGroupId, minPrice, maxPrice, minRating, sort, mine, page = 1, limit = 20 } =
     req.query;
 
   const filter = {};
 
   if (req.user?.role === 'admin') {
     if (status) filter.status = status;
-  } else if (req.user?.role === 'seller') {
+  } else if (req.user?.role === 'seller' && mine === 'true') {
+    // Only the seller's own dashboard/product-management pages send
+    // `mine=true` — the public storefront (home, product list, product
+    // detail, cart) never does, so a logged-in seller browsing as a shopper
+    // still sees the full marketplace instead of just their own catalog.
     const ownSeller = await Seller.findOne({ user: req.user._id });
     filter.seller = ownSeller?._id;
     if (status) filter.status = status;
@@ -95,7 +112,7 @@ const getProducts = asyncHandler(async (req, res) => {
 
   const [products, total] = await Promise.all([
     Product.find(filter)
-      .populate('category', 'name slug')
+      .populate('category', 'name slug type')
       .skip(skip)
       .limit(limitNum)
       .sort(sortOrder),
@@ -108,7 +125,7 @@ const getProducts = asyncHandler(async (req, res) => {
 // GET /api/products/:id
 const getProductById = asyncHandler(async (req, res) => {
   const product = await Product.findById(req.params.id)
-    .populate('category', 'name slug')
+    .populate('category', 'name slug type')
     .populate('seller', 'businessName');
 
   if (!product) {
@@ -151,7 +168,9 @@ const updateProduct = asyncHandler(async (req, res) => {
   ];
 
   editableFields.forEach((field) => {
-    if (req.body[field] !== undefined) product[field] = req.body[field];
+    if (req.body[field] === undefined) return;
+    const isJsonField = field === 'attributes' || field === 'dimensions';
+    product[field] = isJsonField ? parseIfJson(req.body[field]) : req.body[field];
   });
 
   if (req.user.role === 'admin' && req.body.isFeatured !== undefined) {

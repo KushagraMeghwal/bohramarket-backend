@@ -3,6 +3,8 @@ const {
   applySeller,
   getSellers,
   getMySellerProfile,
+  updateMyProfile,
+  retryPickupRegistration,
   getSellerById,
   approveSeller,
   rejectSeller,
@@ -31,6 +33,8 @@ router.post(
 );
 
 router.get('/me', requireRole(['seller']), getMySellerProfile);
+router.patch('/me', requireRole(['seller']), updateMyProfile);
+router.post('/me/retry-pickup-registration', requireRole(['seller']), retryPickupRegistration);
 router.get('/me/stats', requireRole(['seller']), getMyStats);
 router.get('/me/earnings', requireRole(['seller']), getMyEarnings);
 router.get('/', requireRole(['admin']), getSellers);
