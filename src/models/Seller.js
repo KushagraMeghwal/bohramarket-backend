@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { encrypt, mask } = require('../utils/fieldCrypto');
 
 const documentSchema = new mongoose.Schema(
   {
@@ -9,6 +10,12 @@ const documentSchema = new mongoose.Schema(
     },
     url: { type: String, required: true },
     publicId: { type: String, required: true },
+    // 'private' documents are only viewable through a short-lived signed
+    // link (see sellerController.getDocumentUrl); 'upload' marks legacy
+    // documents uploaded publicly before this was fixed (migrated at boot).
+    deliveryType: { type: String, enum: ['upload', 'private'], default: 'upload' },
+    resourceType: { type: String, default: 'image' },
+    format: String,
   },
   { timestamps: true }
 );
@@ -76,5 +83,29 @@ const sellerSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// Aadhaar and bank account numbers are stored encrypted (AES-256-GCM, see
+// utils/fieldCrypto.js) and every JSON serialization masks them and drops
+// document URLs. Code that genuinely needs the full values (admin KYC
+// review) decrypts explicitly via sellerController.revealSensitive().
+sellerSchema.pre('save', function encryptSensitiveFields() {
+  if (this.isModified('aadhaarNumber') && this.aadhaarNumber) {
+    this.aadhaarNumber = encrypt(this.aadhaarNumber);
+  }
+  if (this.isModified('bankDetails.accountNumber') && this.bankDetails?.accountNumber) {
+    this.bankDetails.accountNumber = encrypt(this.bankDetails.accountNumber);
+  }
+});
+
+sellerSchema.set('toJSON', {
+  transform(doc, ret) {
+    if (ret.aadhaarNumber) ret.aadhaarNumber = mask(ret.aadhaarNumber);
+    if (ret.bankDetails?.accountNumber) ret.bankDetails.accountNumber = mask(ret.bankDetails.accountNumber);
+    if (Array.isArray(ret.documents)) {
+      ret.documents = ret.documents.map(({ _id, type, createdAt }) => ({ _id, type, createdAt }));
+    }
+    return ret;
+  },
+});
 
 module.exports = mongoose.model('Seller', sellerSchema);

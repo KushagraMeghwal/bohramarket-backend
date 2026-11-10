@@ -5,7 +5,20 @@ const { generateToken, TOKEN_COOKIE_NAME, COOKIE_OPTIONS } = require('../utils/g
 const { verifyFirebaseIdToken } = require('../utils/verifyFirebaseToken');
 const { sendOtpEmail, sendPasswordResetOtpEmail, isConfigured: isEmailConfigured } = require('../utils/mailer');
 
-const generateOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+const crypto = require('crypto');
+const { isProduction } = require('../config/env');
+
+const generateOtp = () => String(crypto.randomInt(100000, 1000000));
+
+// Returning the code in the API response is a local-development convenience
+// only. In production it would let anyone reset any account's password
+// (this was live: production had no SMTP, so /forgot-password handed the
+// reset code to whoever asked). Production without SMTP refuses instead.
+const exposeDevOtp = !isProduction && !isEmailConfigured;
+const emailUnavailable = isProduction && !isEmailConfigured;
+const EMAIL_UNAVAILABLE_MESSAGE = 'Email verification is temporarily unavailable. Please sign in with Google or try again later.';
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const normalizeEmail = (email) => (typeof email === 'string' ? email.trim().toLowerCase() : '');
 
 // The frontend's route guards decide where to send a seller (onboarding form,
 // pending-approval screen, or dashboard) based on this status, so it has to
@@ -33,22 +46,39 @@ const serializeUser = async (user) => {
 
 // POST /api/auth/register
 const register = asyncHandler(async (req, res) => {
-  const { name, email, password, phone, role } = req.body;
+  const { name, password, phone } = req.body;
+  const email = normalizeEmail(req.body.email);
 
-  if (!name || !email || !password) {
+  if (emailUnavailable) {
+    return res.status(503).json({ message: EMAIL_UNAVAILABLE_MESSAGE });
+  }
+  if (!name || typeof name !== 'string' || !name.trim() || !email || !password) {
     return res.status(400).json({ message: 'Name, email and password are required' });
   }
-
-  if (role && !['customer', 'seller'].includes(role)) {
-    return res.status(400).json({ message: "role must be 'customer' or 'seller'" });
+  if (!EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ message: 'Enter a valid email address' });
   }
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
+  }
+
 
   const existing = await User.findOne({ email });
   if (existing) {
     return res.status(409).json({ message: 'Email already registered' });
   }
 
-  const user = await User.create({ name, email, password, phone, role: role || 'customer', isEmailVerified: false });
+  const user = await User.create({
+    name: name.trim(),
+    email,
+    password,
+    phone: typeof phone === 'string' ? phone.trim() : undefined,
+    // Every new account starts as a customer, whatever the sign-up form's
+    // buy/sell toggle said — submitting a seller application (with KYC) is
+    // what turns it into a seller (sellerController.applySeller).
+    role: 'customer',
+    isEmailVerified: false,
+  });
 
   const otp = generateOtp();
   await user.setEmailOtp(otp);
@@ -58,28 +88,27 @@ const register = asyncHandler(async (req, res) => {
   // No token/cookie yet — the account exists but can't log in until the OTP
   // is verified (see verifyOtp below), so the frontend must route straight
   // to the "enter the code we emailed you" step instead of into the app.
-  // devOtp is only ever included while no real SMTP is configured — nothing
-  // is actually being emailed in that case, so there's nothing to leak, and
-  // it lets the verify page show the code directly for testing without
-  // needing Railway log access. It disappears the moment SMTP is set up.
+  // devOtp is only included on a non-production server with no SMTP (see
+  // exposeDevOtp above), so local testing can verify without an inbox.
   res.status(201).json({
     pendingVerification: true,
     email: user.email,
     message: 'We sent a verification code to your email',
-    ...(isEmailConfigured ? {} : { devOtp: otp }),
+    ...(exposeDevOtp ? { devOtp: otp } : {}),
   });
 });
 
 // POST /api/auth/verify-otp — completes registration (or a login blocked by
 // an unverified email) once the user supplies the code emailed to them.
 const verifyOtp = asyncHandler(async (req, res) => {
-  const { email, otp } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const { otp } = req.body;
 
   if (!email || !otp) {
     return res.status(400).json({ message: 'Email and OTP are required' });
   }
 
-  const user = await User.findOne({ email }).select('+emailOtp +emailOtpExpires');
+  const user = await User.findOne({ email }).select('+emailOtp +emailOtpExpires +emailOtpAttempts');
   if (!user || !(await user.compareEmailOtp(otp))) {
     return res.status(400).json({ message: 'Invalid or expired code' });
   }
@@ -96,7 +125,10 @@ const verifyOtp = asyncHandler(async (req, res) => {
 
 // POST /api/auth/resend-otp
 const resendOtp = asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body.email);
+  if (emailUnavailable) {
+    return res.status(503).json({ message: EMAIL_UNAVAILABLE_MESSAGE });
+  }
   if (!email) {
     return res.status(400).json({ message: 'Email is required' });
   }
@@ -116,15 +148,16 @@ const resendOtp = asyncHandler(async (req, res) => {
 
   res.json({
     message: 'A new verification code has been sent',
-    ...(isEmailConfigured ? {} : { devOtp: otp }),
+    ...(exposeDevOtp ? { devOtp: otp } : {}),
   });
 });
 
 // POST /api/auth/login
 const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
 
-  if (!email || !password) {
+  if (!email || !password || typeof password !== 'string') {
     return res.status(400).json({ message: 'Email and password are required' });
   }
 
@@ -167,6 +200,12 @@ const googleAuth = asyncHandler(async (req, res) => {
   if (!decoded.email) {
     return res.status(400).json({ message: 'Google account has no email on file' });
   }
+  // Linking to an existing account by email is only safe when the identity
+  // provider has verified that address.
+  if (decoded.email_verified === false) {
+    return res.status(401).json({ message: 'Your Google email address is not verified' });
+  }
+  decoded.email = normalizeEmail(decoded.email);
 
   let user = await User.findOne({ email: decoded.email });
 
@@ -205,7 +244,10 @@ const googleAuth = asyncHandler(async (req, res) => {
 // enumeration risk, unlike resend-otp above (that's mid-registration, where
 // the caller already knows the account was just created).
 const forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body.email);
+  if (emailUnavailable) {
+    return res.status(503).json({ message: EMAIL_UNAVAILABLE_MESSAGE });
+  }
   if (!email) {
     return res.status(400).json({ message: 'Email is required' });
   }
@@ -218,7 +260,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
     await user.setPasswordResetOtp(otp);
     await user.save();
     await sendPasswordResetOtpEmail(user.email, otp);
-    if (!isEmailConfigured) devOtp = otp;
+    if (exposeDevOtp) devOtp = otp;
   }
 
   res.json({
@@ -230,15 +272,16 @@ const forgotPassword = asyncHandler(async (req, res) => {
 // POST /api/auth/reset-password
 // Body: { email, otp, newPassword }
 const resetPassword = asyncHandler(async (req, res) => {
-  const { email, otp, newPassword } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const { otp, newPassword } = req.body;
   if (!email || !otp || !newPassword) {
     return res.status(400).json({ message: 'Email, code and new password are required' });
   }
-  if (newPassword.length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  if (typeof newPassword !== 'string' || newPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
   }
 
-  const user = await User.findOne({ email }).select('+passwordResetOtp +passwordResetOtpExpires');
+  const user = await User.findOne({ email }).select('+passwordResetOtp +passwordResetOtpExpires +passwordResetOtpAttempts');
   if (!user || !(await user.comparePasswordResetOtp(otp))) {
     return res.status(400).json({ message: 'Invalid or expired code' });
   }
@@ -269,14 +312,18 @@ const updateMe = asyncHandler(async (req, res) => {
   const { name, phone } = req.body;
 
   if (name !== undefined) {
-    if (!name.trim()) {
+    if (typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ message: 'Name cannot be empty' });
     }
     req.user.name = name.trim();
   }
 
   if (phone !== undefined) {
-    req.user.phone = phone.trim();
+    const trimmed = typeof phone === 'string' ? phone.trim() : '';
+    if (trimmed && !/^[6-9]\d{9}$/.test(trimmed)) {
+      return res.status(400).json({ message: 'Enter a valid 10-digit mobile number' });
+    }
+    req.user.phone = trimmed;
   }
 
   await req.user.save();

@@ -37,7 +37,7 @@ function isCourierServiceable(courier, { requireCod }) {
 // unserviceable path — PART 2.6 step 2), otherwise the chosen courier plus
 // a `chosenBecause` string to store on the shipment record for debugging.
 function selectCourier(couriers, { paymentMethod, strategy } = {}) {
-  const resolvedStrategy = strategy || process.env.SHIPROCKET_COURIER_STRATEGY || 'cheapest';
+  const resolvedStrategy = strategy || process.env.SHIPROCKET_COURIER_STRATEGY || 'balanced';
   const requireCod = paymentMethod === 'COD';
 
   const eligible = (couriers || []).filter((c) => isCourierServiceable(c, { requireCod }));
@@ -58,7 +58,22 @@ function selectCourier(couriers, { paymentMethod, strategy } = {}) {
 
   const [primaryKey, secondaryKey] = resolvedStrategy === 'fastest' ? ['days', 'rate'] : ['rate', 'days'];
 
-  scored.sort((a, b) => {
+  // 'balanced' (default): cheapest courier among those delivering within 7
+  // days, or within 2 days of the fastest option if even that is slower.
+  // Pure 'cheapest' picked a 31-day courier for a 452001 delivery when much
+  // faster ones existed.
+  let candidates = scored;
+  if (resolvedStrategy === 'balanced') {
+    const knownDays = scored.map((s) => s.days).filter(Number.isFinite);
+    if (knownDays.length) {
+      const fastest = Math.min(...knownDays);
+      const limit = Math.max(fastest + 2, 7);
+      const withinLimit = scored.filter((s) => Number.isFinite(s.days) && s.days <= limit);
+      if (withinLimit.length) candidates = withinLimit;
+    }
+  }
+
+  candidates.sort((a, b) => {
     const primaryDiff = rank(a, primaryKey) - rank(b, primaryKey);
     if (primaryDiff !== 0) return primaryDiff;
     const secondaryDiff = rank(a, secondaryKey) - rank(b, secondaryKey);
@@ -66,7 +81,7 @@ function selectCourier(couriers, { paymentMethod, strategy } = {}) {
     return b.rating - a.rating; // rating: higher wins
   });
 
-  const winner = scored[0];
+  const winner = candidates[0];
   return {
     courierId: winner.courier.courier_company_id != null ? String(winner.courier.courier_company_id) : undefined,
     courierName: winner.courier.courier_name,

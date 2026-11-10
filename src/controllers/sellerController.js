@@ -1,8 +1,47 @@
 const User = require('../models/User');
 const Seller = require('../models/Seller');
 const Order = require('../models/Order');
+const Product = require('../models/Product');
+const { respondByFor } = require('../services/sellerResponseWindow.service');
 const asyncHandler = require('../utils/asyncHandler');
 const { registerShiprocketPickup } = require('../services/sellerPickupRegistration.service');
+const cloudinary = require('../config/cloudinary');
+const { decrypt, isMasked } = require('../utils/fieldCrypto');
+
+const AADHAAR_PATTERN = /^\d{12}$/;
+const PAN_PATTERN = /^[A-Z]{5}\d{4}[A-Z]$/;
+const IFSC_PATTERN = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+const DOCUMENT_LINK_TTL_SECONDS = 10 * 60;
+const CANCELLED_ITEM_STATUSES = ['cancelled', 'rto'];
+
+// Cloudinary's secure_url carries the resource type and extension:
+// https://res.cloudinary.com/<cloud>/<resource_type>/<type>/v123/<public_id>.<format>
+function describeUpload(file) {
+  const match = String(file.path || '').match(/\/(image|raw|video)\/(upload|private|authenticated)\/.*\.([a-z0-9]+)(?:\?|$)/i);
+  return {
+    resourceType: match ? match[1] : 'image',
+    deliveryType: match && match[2] === 'private' ? 'private' : 'upload',
+    format: match ? match[3].toLowerCase() : undefined,
+  };
+}
+
+// Full Aadhaar / account number, decrypted — admin KYC review only.
+function revealSensitive(seller) {
+  return {
+    aadhaarNumber: decrypt(seller.aadhaarNumber) || null,
+    accountNumber: decrypt(seller.bankDetails?.accountNumber) || null,
+  };
+}
+
+function validateKyc({ panNumber, aadhaarNumber, bankDetails }) {
+  if (panNumber && !PAN_PATTERN.test(String(panNumber).toUpperCase())) return 'PAN must look like ABCDE1234F';
+  if (aadhaarNumber && !AADHAAR_PATTERN.test(String(aadhaarNumber).replace(/\s/g, ''))) return 'Aadhaar number must be 12 digits';
+  if (bankDetails?.ifscCode && !IFSC_PATTERN.test(String(bankDetails.ifscCode).toUpperCase())) return 'IFSC code looks invalid';
+  if (bankDetails?.accountNumber && !isMasked(bankDetails.accountNumber) && !/^\d{9,18}$/.test(String(bankDetails.accountNumber))) {
+    return 'Bank account number must be 9-18 digits';
+  }
+  return null;
+}
 
 const COMMISSION_PERCENT = Number(process.env.PLATFORM_COMMISSION_PERCENT) || 0;
 
@@ -30,6 +69,10 @@ const applySeller = asyncHandler(async (req, res) => {
   if (!businessName || !contactPhone || !pickupAddress) {
     return res.status(400).json({ message: 'Missing required business details' });
   }
+  const kycError = validateKyc({ panNumber, aadhaarNumber, bankDetails: parseIfJson(bankDetails) });
+  if (kycError) {
+    return res.status(400).json({ message: kycError });
+  }
 
   // Every applicant proves identity (PAN + Aadhaar) and a business/bank
   // proof — no optional-vs-mandatory distinction, all three are required.
@@ -42,7 +85,11 @@ const applySeller = asyncHandler(async (req, res) => {
   const documents = [];
   Object.entries(req.files).forEach(([fieldName, files]) => {
     files.forEach((file) => {
-      documents.push({ type: fieldName, url: file.path, publicId: file.filename });
+      // Cloudinary returns private assets with a permanent signature baked
+      // into the URL (/s--xxxx--/). Store it unsigned, so the database never
+      // holds a working link; viewing goes through getDocumentUrl.
+      const unsignedUrl = String(file.path).replace(/\/s--[^/]+--\//, '/');
+      documents.push({ type: fieldName, url: unsignedUrl, publicId: file.filename, ...describeUpload(file) });
     });
   });
 
@@ -50,8 +97,8 @@ const applySeller = asyncHandler(async (req, res) => {
     businessName,
     businessType,
     gstNumber,
-    panNumber,
-    aadhaarNumber,
+    panNumber: panNumber ? String(panNumber).toUpperCase() : panNumber,
+    aadhaarNumber: aadhaarNumber ? String(aadhaarNumber).replace(/\s/g, '') : aadhaarNumber,
     contactPhone,
     pickupAddress: parseIfJson(pickupAddress),
     bankDetails: parseIfJson(bankDetails),
@@ -98,7 +145,7 @@ const getSellerById = asyncHandler(async (req, res) => {
   if (!seller) {
     return res.status(404).json({ message: 'Seller not found' });
   }
-  res.json({ seller });
+  res.json({ seller, sensitive: revealSensitive(seller) });
 });
 
 // PATCH /api/sellers/me
@@ -121,10 +168,23 @@ const updateMyProfile = asyncHandler(async (req, res) => {
   const oldPickupAddress = seller.pickupAddress?.toObject ? seller.pickupAddress.toObject() : seller.pickupAddress;
   const pickupAddressChanged = JSON.stringify(oldPickupAddress) !== JSON.stringify(newPickupAddress);
 
+  const newBankDetails = bankDetails ? parseIfJson(bankDetails) : null;
+  const kycError = validateKyc({ bankDetails: newBankDetails });
+  if (kycError) {
+    return res.status(400).json({ message: kycError });
+  }
+
   seller.businessName = businessName;
   seller.contactPhone = contactPhone;
   seller.pickupAddress = newPickupAddress;
-  if (bankDetails) seller.bankDetails = parseIfJson(bankDetails);
+  if (newBankDetails) {
+    // The profile form only ever sees the masked number ("XXXXXX1234"); when
+    // it comes back unchanged, keep the stored (encrypted) value.
+    if (!newBankDetails.accountNumber || isMasked(newBankDetails.accountNumber)) {
+      newBankDetails.accountNumber = seller.bankDetails?.accountNumber;
+    }
+    seller.bankDetails = newBankDetails;
+  }
 
   if (pickupAddressChanged) {
     // The old Shiprocket pickup location (registered off the *previous*
@@ -286,9 +346,10 @@ const getMyStats = asyncHandler(async (req, res) => {
       if (String(item.seller) !== String(seller._id)) return;
       sellerHasItem = true;
 
-      if (item.itemStatus === 'rto') pendingReturns += 1;
+      if (item.itemStatus === 'rto' || ['return_requested', 'return_picked'].includes(item.sellerOrderStatus)) pendingReturns += 1;
 
-      if (item.itemStatus !== 'cancelled' && item.itemStatus !== 'rto') {
+      const unpaidOnline = order.paymentMethod === 'online' && order.paymentStatus !== 'paid';
+      if (!CANCELLED_ITEM_STATUSES.includes(item.itemStatus) && !unpaidOnline) {
         totalRevenue += item.subtotal;
         const monthKey = order.createdAt.toISOString().slice(0, 7);
         salesByMonth[monthKey] = (salesByMonth[monthKey] || 0) + item.subtotal;
@@ -326,8 +387,15 @@ const getMyEarnings = asyncHandler(async (req, res) => {
     order.items
       .filter((item) => String(item.seller) === String(seller._id))
       .forEach((item) => {
+        // Cancelled, rejected, returned or never-paid items earn nothing —
+        // they used to be counted, inflating the seller's earnings.
+        const unpaidOnline = order.paymentMethod === 'online' && order.paymentStatus === 'pending';
+        const excluded =
+          CANCELLED_ITEM_STATUSES.includes(item.itemStatus) || item.sellerOrderStatus === 'return_delivered' || unpaidOnline;
+        if (excluded) return;
+
         const commission = Math.round(item.subtotal * (COMMISSION_PERCENT / 100) * 100) / 100;
-        const netEarning = item.subtotal - commission;
+        const netEarning = Math.round((item.subtotal - commission) * 100) / 100;
         totalNetEarning += netEarning;
 
         ledger.push({
@@ -340,16 +408,83 @@ const getMyEarnings = asyncHandler(async (req, res) => {
           netEarning,
           itemStatus: item.itemStatus,
           paymentStatus: order.paymentStatus,
-          payoutStatus: order.paymentStatus === 'paid' ? 'pending_payout' : 'awaiting_payment',
+          payoutStatus: item.itemStatus === 'delivered' && order.paymentStatus === 'paid' ? 'pending_payout' : 'awaiting_delivery',
           createdAt: order.createdAt,
         });
       });
   });
 
-  res.json({ ledger, totalNetEarning, commissionPercent: COMMISSION_PERCENT });
+  res.json({ ledger, totalNetEarning: Math.round(totalNetEarning * 100) / 100, commissionPercent: COMMISSION_PERCENT });
+});
+
+// GET /api/sellers/me/notifications
+// Counts behind the seller portal's sidebar badges and notification bell —
+// everything a seller needs to act on, cheap enough to poll every minute.
+const getMyNotifications = asyncHandler(async (req, res) => {
+  const seller = await Seller.findOne({ user: req.user._id }).select('_id status shiprocketPickupStatus shiprocketPickupError');
+  if (!seller) {
+    return res.status(404).json({ message: 'Seller profile not found' });
+  }
+
+  const [awaiting, toShip, inReview, rejected, lowStock, outOfStock] = await Promise.all([
+    Order.aggregate([
+      { $match: { 'items.seller': seller._id } },
+      { $unwind: '$items' },
+      // Online orders only count once paid — the seller can't accept before that.
+      { $match: { 'items.seller': seller._id, 'items.sellerOrderStatus': 'awaiting_seller', $or: [{ paymentMethod: 'COD' }, { paymentStatus: 'paid' }] } },
+      { $group: { _id: null, count: { $sum: 1 }, oldest: { $min: { $ifNull: ['$paidAt', '$createdAt'] } } } },
+    ]),
+    Order.aggregate([
+      { $match: { 'items.seller': seller._id } },
+      { $unwind: '$items' },
+      { $match: { 'items.seller': seller._id, 'items.sellerOrderStatus': { $in: ['accepted', 'confirmed', 'ready_to_ship'] }, 'items.itemStatus': { $in: ['placed', 'packed'] } } },
+      { $count: 'count' },
+    ]),
+    Product.countDocuments({ seller: seller._id, status: 'pending_review' }),
+    Product.countDocuments({ seller: seller._id, status: 'rejected' }),
+    Product.countDocuments({ seller: seller._id, status: 'active', stock: { $gt: 0, $lte: 5 } }),
+    Product.countDocuments({ seller: seller._id, status: 'active', stock: 0 }),
+  ]);
+
+  const awaitingCount = awaiting[0]?.count || 0;
+  const respondBy = awaitingCount ? respondByFor({ createdAt: awaiting[0].oldest }) : null;
+
+  res.json({
+    orders: { awaitingResponse: awaitingCount, toShip: toShip[0]?.count || 0, oldestRespondBy: respondBy },
+    products: { inReview, rejected, lowStock, outOfStock },
+    pickupRegistrationFailed: seller.shiprocketPickupStatus === 'failed',
+    pickupError: seller.shiprocketPickupStatus === 'failed' ? seller.shiprocketPickupError : undefined,
+  });
+});
+
+// GET /api/sellers/:id/documents/:docId/url (admin)
+// GET /api/sellers/me/documents/:docId/url (the seller themselves)
+// Returns a download link that expires after DOCUMENT_LINK_TTL_SECONDS.
+const getDocumentUrl = asyncHandler(async (req, res) => {
+  const seller = req.params.id
+    ? await Seller.findById(req.params.id)
+    : await Seller.findOne({ user: req.user._id });
+  if (!seller) {
+    return res.status(404).json({ message: 'Seller not found' });
+  }
+  const doc = seller.documents.id(req.params.docId);
+  if (!doc) {
+    return res.status(404).json({ message: 'Document not found' });
+  }
+
+  const format = doc.format || (doc.url.match(/\.([a-z0-9]+)(?:\?|$)/i) || [])[1] || 'jpg';
+  const url = cloudinary.utils.private_download_url(doc.publicId, format, {
+    resource_type: doc.resourceType || 'image',
+    type: doc.deliveryType === 'private' ? 'private' : 'upload',
+    expires_at: Math.floor(Date.now() / 1000) + DOCUMENT_LINK_TTL_SECONDS,
+  });
+
+  res.json({ url, expiresInSeconds: DOCUMENT_LINK_TTL_SECONDS });
 });
 
 module.exports = {
+  getMyNotifications,
+  getDocumentUrl,
   applySeller,
   getSellers,
   getMySellerProfile,

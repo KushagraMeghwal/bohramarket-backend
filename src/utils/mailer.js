@@ -61,4 +61,25 @@ async function sendPasswordResetOtpEmail(to, otp) {
   });
 }
 
-module.exports = { sendMail, sendOtpEmail, sendPasswordResetOtpEmail, isConfigured };
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+
+// Plain transactional notification (new order for a seller, order status for
+// a customer, alerts for admins). `link` is an optional absolute URL rendered
+// as a button.
+async function sendNotificationEmail({ to, subject, message, link, linkLabel = 'Open BohraMart' }) {
+  await sendMail({
+    to,
+    subject,
+    text: link ? `${message}\n\n${link}` : message,
+    html: `
+      <div style="font-family: sans-serif; max-width: 520px; margin: 0 auto;">
+        <h2 style="color: #1f7a4d;">BohraMart</h2>
+        <p style="font-size: 15px; line-height: 1.6;">${escapeHtml(message)}</p>
+        ${link ? `<p><a href="${escapeHtml(link)}" style="display:inline-block;background:#C8952F;color:#241F18;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700;">${escapeHtml(linkLabel)}</a></p>` : ''}
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendMail, sendOtpEmail, sendPasswordResetOtpEmail, sendNotificationEmail, isConfigured };

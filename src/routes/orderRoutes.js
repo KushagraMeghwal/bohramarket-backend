@@ -11,6 +11,8 @@ const {
   cancelOrder,
   requestReturn,
   trackOrder,
+  payOrder,
+  retryRefund,
 } = require('../controllers/orderController');
 const { verifyToken, requireRole } = require('../middleware/authMiddleware');
 
@@ -30,6 +32,8 @@ router.get('/', getOrders);
 router.get('/:id', getOrderById);
 router.get('/:id/track', trackOrder);
 router.post('/:id/verify-payment', requireRole(BUYER_ROLES), verifyPayment);
+router.post('/:id/pay', requireRole(BUYER_ROLES), payOrder);
+router.post('/:id/refunds/:refundId/retry', requireRole(['admin']), retryRefund);
 router.patch('/:id/mark-cod-paid', requireRole(['seller', 'admin']), markCodPaid);
 router.patch('/:id/items/:itemId/status', requireRole(['seller', 'admin']), updateItemStatus);
 router.patch('/:id/admin-status', requireRole(['admin']), adminUpdateOrderStatus);

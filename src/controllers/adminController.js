@@ -7,14 +7,22 @@ const asyncHandler = require('../utils/asyncHandler');
 
 const RETURN_STATUSES = ['return_requested', 'return_picked', 'return_delivered'];
 
+// Revenue = money actually collected: prepaid orders that were paid, plus
+// COD orders that were delivered (or marked paid), less anything refunded.
+// It used to sum every order's total, including unpaid and cancelled ones.
+const REALIZED_REVENUE_MATCH = {
+  $or: [{ paymentStatus: { $in: ['paid', 'refunded'] } }, { paymentMethod: 'COD', orderStatus: 'delivered' }],
+};
+const REALIZED_AMOUNT = { $subtract: ['$totalAmount', { $ifNull: ['$refundedAmount', 0] }] };
+
 const getDashboard = asyncHandler(async (req, res) => {
   const [sellerCounts, productCounts, totalOrders, revenueAgg, pendingSellers, pendingProducts] = await Promise.all([
     Seller.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
     Product.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
     Order.countDocuments(),
     Order.aggregate([
-      { $match: { paymentStatus: { $ne: 'failed' } } },
-      { $group: { _id: null, totalRevenue: { $sum: '$totalAmount' } } },
+      { $match: REALIZED_REVENUE_MATCH },
+      { $group: { _id: null, totalRevenue: { $sum: REALIZED_AMOUNT } } },
     ]),
     Seller.find({ status: 'pending' }).populate('user', 'name email phone').sort('-createdAt').limit(5),
     Product.find({ status: 'pending_review' })
@@ -62,7 +70,7 @@ const getDashboard = asyncHandler(async (req, res) => {
 // PART 2.12: one consolidated view of everything the fulfillment automation
 // (PARTs 2.4-2.11) couldn't resolve on its own and needs a human to look at.
 const getNeedsAttention = asyncHandler(async (req, res) => {
-  const [failedJobs, failedPickupRegistrations, unserviceableOrderDocs, missedResponseOrderDocs] = await Promise.all([
+  const [failedJobs, failedPickupRegistrations, unserviceableOrderDocs, missedResponseOrderDocs, failedRefundOrderDocs] = await Promise.all([
     ShipmentJob.find({ status: 'needs_attention' })
       .populate('order', 'orderNumber')
       .populate('seller', 'businessName')
@@ -84,7 +92,22 @@ const getNeedsAttention = asyncHandler(async (req, res) => {
       .select('orderNumber items createdAt')
       .sort('-createdAt')
       .limit(50),
+    Order.find({ 'refunds.status': 'failed' }).select('orderNumber refunds createdAt').sort('-updatedAt').limit(50),
   ]);
+
+  const failedRefunds = failedRefundOrderDocs.flatMap((order) =>
+    order.refunds
+      .filter((refund) => refund.status === 'failed')
+      .map((refund) => ({
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        refundId: refund._id,
+        amount: refund.amount,
+        reason: refund.reason,
+        error: refund.error,
+        createdAt: refund.createdAt,
+      }))
+  );
 
   // Flattened to just the affected item(s) — an order can have other,
   // unrelated items mixed in, and an admin reading this list shouldn't have
@@ -114,7 +137,7 @@ const getNeedsAttention = asyncHandler(async (req, res) => {
       }))
   );
 
-  res.json({ failedJobs, failedPickupRegistrations, unserviceableOrders, missedResponseWindow });
+  res.json({ failedJobs, failedPickupRegistrations, unserviceableOrders, missedResponseWindow, failedRefunds });
 });
 
 // POST /api/admin/shipment-jobs/:id/retry
@@ -139,7 +162,7 @@ const retryShipmentJob = asyncHandler(async (req, res) => {
 // count-only query rather than pulling the full populated documents both of
 // those return.
 const getBadgeCounts = asyncHandler(async (req, res) => {
-  const [pendingSellers, pendingProducts, needsAttentionJobs, failedPickups, unserviceableCount, missedResponseCount] =
+  const [pendingSellers, pendingProducts, needsAttentionJobs, failedPickups, unserviceableCount, missedResponseCount, failedRefundCount] =
     await Promise.all([
       Seller.countDocuments({ status: 'pending' }),
       Product.countDocuments({ status: 'pending_review' }),
@@ -147,12 +170,13 @@ const getBadgeCounts = asyncHandler(async (req, res) => {
       Seller.countDocuments({ shiprocketPickupStatus: 'failed' }),
       Order.countDocuments({ 'items.sellerRejectReason': { $regex: /no courier is serviceable/i } }),
       Order.countDocuments({ 'items.sellerRejectReason': { $regex: /no response from seller within/i } }),
+      Order.countDocuments({ 'refunds.status': 'failed' }),
     ]);
 
   res.json({
     pendingSellers,
     pendingProducts,
-    needsAttention: needsAttentionJobs + failedPickups + unserviceableCount + missedResponseCount,
+    needsAttention: needsAttentionJobs + failedPickups + unserviceableCount + missedResponseCount + failedRefundCount,
   });
 });
 
@@ -184,11 +208,11 @@ const getAnalytics = asyncHandler(async (req, res) => {
 
   const [revenueByDay, categoryDemand, topLovedProducts, sellerReturnRates] = await Promise.all([
     Order.aggregate([
-      { $match: { createdAt: { $gte: rangeStart, $lt: rangeEnd }, paymentStatus: { $ne: 'failed' } } },
+      { $match: { createdAt: { $gte: rangeStart, $lt: rangeEnd }, ...REALIZED_REVENUE_MATCH } },
       {
         $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          revenue: { $sum: '$totalAmount' },
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'Asia/Kolkata' } },
+          revenue: { $sum: REALIZED_AMOUNT },
           orders: { $sum: 1 },
         },
       },
@@ -199,7 +223,7 @@ const getAnalytics = asyncHandler(async (req, res) => {
     Order.aggregate([
       { $match: { createdAt: { $gte: rangeStart, $lt: rangeEnd } } },
       { $unwind: '$items' },
-      { $match: { 'items.sellerOrderStatus': { $ne: 'cancelled' } } },
+      { $match: { 'items.itemStatus': { $nin: ['cancelled', 'rto'] } } },
       { $lookup: { from: 'products', localField: 'items.product', foreignField: '_id', as: 'productDoc' } },
       { $unwind: '$productDoc' },
       { $group: { _id: '$productDoc.category', unitsSold: { $sum: '$items.quantity' }, revenue: { $sum: '$items.subtotal' } } },

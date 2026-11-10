@@ -60,6 +60,10 @@ const userSchema = new mongoose.Schema(
     // must never overwrite or invalidate each other.
     passwordResetOtp: { type: String, select: false },
     passwordResetOtpExpires: { type: Date, select: false },
+    // Wrong guesses against the current code. A 6-digit code is only safe if
+    // it can't be brute-forced, so it's burned after MAX_OTP_ATTEMPTS.
+    emailOtpAttempts: { type: Number, default: 0, select: false },
+    passwordResetOtpAttempts: { type: Number, default: 0, select: false },
   },
   { timestamps: true }
 );
@@ -78,23 +82,45 @@ userSchema.methods.comparePassword = function comparePassword(candidate) {
 userSchema.methods.setEmailOtp = async function setEmailOtp(otp) {
   this.emailOtp = await bcrypt.hash(otp, 10);
   this.emailOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+  this.emailOtpAttempts = 0;
 };
 
+const MAX_OTP_ATTEMPTS = 5;
+
+// Checks a code and records a failed guess; after MAX_OTP_ATTEMPTS wrong
+// guesses the code is invalidated and a new one must be requested. Saves the
+// attempt counter itself so a failed guess always counts.
+async function checkOtp(user, candidate, field) {
+  const hash = user[field];
+  const expires = user[field + 'Expires'];
+  const attemptsField = field + 'Attempts';
+  if (!hash || !expires || expires.getTime() < Date.now()) return false;
+  if ((user[attemptsField] || 0) >= MAX_OTP_ATTEMPTS) return false;
+
+  const ok = await bcrypt.compare(String(candidate), hash);
+  if (!ok) {
+    user[attemptsField] = (user[attemptsField] || 0) + 1;
+    if (user[attemptsField] >= MAX_OTP_ATTEMPTS) {
+      user[field] = undefined;
+      user[field + 'Expires'] = undefined;
+    }
+    await user.save();
+  }
+  return ok;
+}
+
 userSchema.methods.compareEmailOtp = function compareEmailOtp(candidate) {
-  if (!this.emailOtp || !this.emailOtpExpires) return Promise.resolve(false);
-  if (this.emailOtpExpires.getTime() < Date.now()) return Promise.resolve(false);
-  return bcrypt.compare(candidate, this.emailOtp);
+  return checkOtp(this, candidate, 'emailOtp');
 };
 
 userSchema.methods.setPasswordResetOtp = async function setPasswordResetOtp(otp) {
   this.passwordResetOtp = await bcrypt.hash(otp, 10);
   this.passwordResetOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+  this.passwordResetOtpAttempts = 0;
 };
 
 userSchema.methods.comparePasswordResetOtp = function comparePasswordResetOtp(candidate) {
-  if (!this.passwordResetOtp || !this.passwordResetOtpExpires) return Promise.resolve(false);
-  if (this.passwordResetOtpExpires.getTime() < Date.now()) return Promise.resolve(false);
-  return bcrypt.compare(candidate, this.passwordResetOtp);
+  return checkOtp(this, candidate, 'passwordResetOtp');
 };
 
 module.exports = mongoose.model('User', userSchema);

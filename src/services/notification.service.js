@@ -5,6 +5,9 @@
 // break order/fulfillment flow (see every call site's own "not awaited" or
 // ".catch()" comments).
 const { SMS_TEMPLATES } = require('../config/smsTemplates');
+const { sendNotificationEmail } = require('../utils/mailer');
+const User = require('../models/User');
+const Seller = require('../models/Seller');
 
 class ConsoleSmsProvider {
   async send(to, message, templateKey) {
@@ -78,12 +81,70 @@ async function sendSms({ to, templateKey, vars = {} }) {
 // "needs attention" surfaces built in PART 2.12, which don't depend on
 // anyone watching logs. Replace with real email/Slack/push once a channel
 // exists — deliberately not invented here.
-function notifyAdmin(message) {
+// Email is the delivery channel that actually reaches people today (SMS is
+// still console-only until a DLT-registered provider exists). Every
+// notification below is best-effort: a mail failure is logged, never thrown,
+// so it can't break the order flow that triggered it.
+const CLIENT_URL = () => (process.env.CLIENT_URL || 'https://bohramart-6e152.web.app').replace(/\/$/, '');
+
+async function safeEmail(payload, context) {
+  try {
+    await sendNotificationEmail(payload);
+  } catch (err) {
+    console.error(`[notify] email failed (${context}) to=${payload.to}:`, err.message || err);
+  }
+}
+
+async function notifyAdmin(message) {
   console.warn(`[admin-notify] ${message}`);
+  try {
+    const configured = (process.env.ADMIN_NOTIFICATION_EMAIL || '').split(',').map((e) => e.trim()).filter(Boolean);
+    const recipients = configured.length
+      ? configured
+      : (await User.find({ role: 'admin', isActive: true }).select('email')).map((u) => u.email);
+    await Promise.all(
+      recipients.map((to) =>
+        safeEmail({ to, subject: 'BohraMart admin alert', message, link: `${CLIENT_URL()}/admin/needs-attention`, linkLabel: 'Open admin panel' }, 'admin')
+      )
+    );
+  } catch (err) {
+    console.error('[admin-notify] failed to resolve admin recipients', err.message || err);
+  }
 }
 
-function notifySeller(sellerId, message) {
+async function notifySeller(sellerId, message, { link = '/seller/orders' } = {}) {
   console.warn(`[seller-notify:${sellerId}] ${message}`);
+  try {
+    const seller = await Seller.findById(sellerId).populate('user', 'email');
+    if (!seller?.user?.email) {
+      console.warn(`[seller-notify:${sellerId}] seller has no email on file — not sent`);
+      return;
+    }
+    await safeEmail({ to: seller.user.email, subject: `BohraMart: ${message}`.slice(0, 140), message, link: `${CLIENT_URL()}${link}`, linkLabel: 'Open seller dashboard' }, 'seller');
+  } catch (err) {
+    console.error(`[seller-notify:${sellerId}] failed`, err.message || err);
+  }
 }
 
-module.exports = { sendSms, notifyAdmin, notifySeller };
+// Customer-facing order update: SMS to the shipping phone plus an email to
+// the account's address, both rendered from the same SMS_TEMPLATES text.
+async function notifyCustomer({ order, templateKey, vars = {} }) {
+  sendSms({ to: order?.shippingAddress?.phone, templateKey, vars });
+
+  const buildMessage = SMS_TEMPLATES[templateKey];
+  if (!buildMessage || !order?.customer) return;
+  try {
+    const customerId = order.customer._id || order.customer;
+    const customer = await User.findById(customerId).select('email');
+    if (!customer?.email) return;
+    const message = buildMessage(vars).replace(/^BohraMart:\s*/, '');
+    await safeEmail(
+      { to: customer.email, subject: `BohraMart order ${order.orderNumber}`, message, link: `${CLIENT_URL()}/account/orders/${order._id}`, linkLabel: 'View order' },
+      `customer:${templateKey}`
+    );
+  } catch (err) {
+    console.error(`[customer-notify] failed for order ${order?.orderNumber}`, err.message || err);
+  }
+}
+
+module.exports = { sendSms, notifyAdmin, notifySeller, notifyCustomer };

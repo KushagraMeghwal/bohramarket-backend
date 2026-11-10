@@ -20,8 +20,7 @@ const shiprocketService = require('./shiprocket.service');
 const { computeShipmentDimensions } = require('./orderFulfillment.service');
 const { selectCourier } = require('./courierSelection.service');
 
-const FLAT_SHIPPING_FEE = 49;
-const FREE_SHIPPING_THRESHOLD = 999;
+const { FLAT_SHIPPING_FEE, FREE_SHIPPING_THRESHOLD } = require('../config/shop');
 
 // groupedBySeller: Map<sellerId, { items: [{product, quantity, name}], productById: Map, subtotal: number }>
 // Returns { serviceable, shippingFee, estimatedDeliveryDays, perSeller, unserviceableProductNames, usedFallback }

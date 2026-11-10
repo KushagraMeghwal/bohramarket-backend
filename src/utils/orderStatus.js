@@ -27,6 +27,11 @@ const maybeStartReturnWindow = (order) => {
   if (order.orderStatus === 'delivered' && !order.returnEligibleUntil) {
     order.returnEligibleUntil = new Date(Date.now() + RETURN_WINDOW_MS);
   }
+  // A delivered COD order means the courier collected the cash.
+  if (order.orderStatus === 'delivered' && order.paymentMethod === 'COD' && order.paymentStatus === 'pending') {
+    order.paymentStatus = 'paid';
+    order.paidAt = new Date();
+  }
 };
 
 module.exports = { ITEM_STATUS_RANK, TERMINAL_ITEM_STATUSES, recalcOrderStatus, maybeStartReturnWindow };

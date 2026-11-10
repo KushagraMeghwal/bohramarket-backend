@@ -1,0 +1,8 @@
+# Files never uploaded to Cloud Build (secrets, local artifacts).
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+tmp-test-doc.pdf
+.git

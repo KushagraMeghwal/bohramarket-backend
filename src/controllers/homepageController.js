@@ -7,16 +7,16 @@ const asyncHandler = require('../utils/asyncHandler');
 const DEFAULT_CONTENT = {
   heroSlides: [
     {
-      tag: 'Golden Hour Sale',
-      title: 'Boutique heritage pieces, modern .',
+      tag: 'New Arrivals',
+      title: 'Boutique heritage pieces, made modern.',
       subtitle: 'From ridas and topis to attars, gifting sellers present their finest work beautifully.',
-      cta: 'Shop the Sale',
+      cta: 'Shop Now',
       ctaLink: '/products',
     },
     {
-      tag: 'Zero Listing Fees',
+      tag: 'Sell on BohraMart',
       title: 'Turn your craft into a thriving storefront.',
-      subtitle: 'List anything in minutes. No fees this week, and easy onboarding for community-verified sellers.',
+      subtitle: 'List your products in minutes with easy onboarding for community-verified sellers.',
       cta: 'Start Selling',
       ctaLink: '/seller/apply',
     },
@@ -32,7 +32,7 @@ const DEFAULT_CONTENT = {
     { icon: '🚚', title: 'Free Shipping', sub: 'On orders above Rs 999' },
     { icon: '🛡️', title: 'Buyer Protection', sub: 'Verified sellers only' },
     { icon: '↩️', title: 'Easy Returns', sub: '7-day return window' },
-    { icon: '💬', title: '24/7 Support', sub: '' },
+    { icon: '💬', title: 'WhatsApp Support', sub: '' },
   ],
   topRatedTitle: 'Top Rated, Most Loved',
   topRatedSubtitle: 'Highest rated picks from sellers across every category',

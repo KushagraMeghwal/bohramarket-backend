@@ -8,6 +8,7 @@ const Order = require('../models/Order');
 const Seller = require('../models/Seller');
 const { withRetry } = require('./shiprocketRetry.service');
 const { startInterval } = require('../utils/scheduler');
+const notificationService = require('./notification.service');
 
 const MAX_JOB_ATTEMPTS = Number(process.env.SHIPMENT_JOB_MAX_ATTEMPTS) || 3;
 const POLL_INTERVAL_MS = Number(process.env.SHIPMENT_JOB_POLL_INTERVAL_MS) || 30000;
@@ -70,12 +71,17 @@ async function runJob(job) {
     }
   } catch (err) {
     job.attempts += 1;
-    job.lastError = err.message || String(err);
+    // Permanent errors (Shiprocket permission refusals) carry a plain-English
+    // explanation of what to fix; keep the raw response after it for support.
+    job.lastError = err.adminHint ? `${err.adminHint} [${err.message}]` : err.message || String(err);
 
-    if (job.attempts >= MAX_JOB_ATTEMPTS) {
+    if (err.permanent || job.attempts >= MAX_JOB_ATTEMPTS) {
       job.status = 'needs_attention';
       console.error(
-        `[shipment-jobs] job ${job._id} (${job.step}, order ${order.orderNumber}) needs attention after ${job.attempts} attempts: ${job.lastError}`
+        `[shipment-jobs] job ${job._id} (${job.step}, order ${order.orderNumber}) needs attention after ${job.attempts} attempt(s): ${job.lastError}`
+      );
+      notificationService.notifyAdmin(
+        `Shipping for order ${order.orderNumber} (${seller.businessName}) is stuck at "${job.step.replace(/_/g, ' ')}": ${err.adminHint || job.lastError}`
       );
     } else {
       job.status = 'pending';

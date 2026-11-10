@@ -152,6 +152,24 @@ const orderItemSchema = new mongoose.Schema(
     // courierName, shipmentStatus, etc.) are identical in kind, just for the
     // opposite direction.
     returnShipment: shipmentSchema,
+    // Set once this item's money has been refunded (or a Razorpay refund
+    // requested for it) so no code path can refund the same item twice.
+    refundedAmount: { type: Number, default: 0 },
+    refundedAt: Date,
+  },
+  { timestamps: true }
+);
+
+const refundSchema = new mongoose.Schema(
+  {
+    razorpayRefundId: String,
+    amount: { type: Number, required: true },
+    status: { type: String, enum: ['pending', 'processed', 'failed'], default: 'pending' },
+    reason: String,
+    itemIds: [mongoose.Schema.Types.ObjectId],
+    includesShipping: { type: Boolean, default: false },
+    error: String,
+    processedAt: Date,
   },
   { timestamps: true }
 );
@@ -178,9 +196,14 @@ const orderSchema = new mongoose.Schema(
     },
     refundStatus: {
       type: String,
-      enum: ['none', 'refund_pending', 'refunded'],
+      enum: ['none', 'refund_pending', 'partially_refunded', 'refunded', 'refund_failed'],
       default: 'none',
     },
+    // One entry per Razorpay refund request. refundStatus above is the
+    // roll-up of these (see refund.service.js).
+    refunds: [refundSchema],
+    refundedAmount: { type: Number, default: 0 },
+    paidAt: Date,
     // Set once, when the order first reaches orderStatus 'delivered' (7 days
     // out from that moment). One window for the whole order — items across
     // sellers can still ship/deliver at different times, but this is

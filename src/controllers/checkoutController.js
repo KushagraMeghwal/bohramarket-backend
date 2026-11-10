@@ -83,4 +83,31 @@ const getShippingEstimate = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { getShippingEstimate, groupCartBySeller, FLAT_SHIPPING_FEE };
+// GET /api/checkout/delivery-estimate?productId=&pincode=  (public)
+// Real courier ETA for one product to one pincode — replaces the product
+// page's old hardcoded "delivery by <today + 4 days>".
+const getDeliveryEstimate = asyncHandler(async (req, res) => {
+  const { productId, pincode } = req.query;
+  if (!pincode || !PINCODE_PATTERN.test(String(pincode))) {
+    return res.status(400).json({ message: 'Enter a valid 6-digit pincode' });
+  }
+  if (!productId || !/^[a-f0-9]{24}$/i.test(String(productId))) {
+    return res.status(400).json({ message: 'productId is required' });
+  }
+
+  const product = await Product.findOne({ _id: productId, status: 'active' }).select('_id');
+  if (!product) {
+    return res.status(404).json({ message: 'Product not available' });
+  }
+
+  const { groupedBySeller, itemsTotal } = await groupCartBySeller([{ productId, quantity: 1 }]);
+  const result = await computeShippingForCart({ groupedBySeller, deliveryPincode: String(pincode), paymentMethod: 'online', itemsTotal });
+
+  res.json({
+    serviceable: result.serviceable,
+    estimatedDeliveryDays: result.estimatedDeliveryDays,
+    usedFallback: result.usedFallback,
+  });
+});
+
+module.exports = { getShippingEstimate, getDeliveryEstimate, groupCartBySeller, FLAT_SHIPPING_FEE };

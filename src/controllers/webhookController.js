@@ -4,6 +4,9 @@ const WebhookEvent = require('../models/WebhookEvent');
 const { recalcOrderStatus, maybeStartReturnWindow, TERMINAL_ITEM_STATUSES } = require('../utils/orderStatus');
 const { mapShiprocketStatus, summarizeFulfillment } = require('../config/shipmentStatus');
 const notificationService = require('../services/notification.service');
+const { refundItems, applyRefundWebhook } = require('../services/refund.service');
+const { onOnlineOrderPaid } = require('../services/orderEvents.service');
+const { isProduction } = require('../config/env');
 
 // SMS fires only for status TEXT that actually maps to one of these
 // sellerOrderStatus values, and only once per real transition into it (see
@@ -97,8 +100,9 @@ async function processRazorpayEvent(event) {
 
   const idempotencyKey = `${event.event}:${entityId}`;
 
+  let eventRecord;
   try {
-    await WebhookEvent.create({ razorpayEventId: idempotencyKey, eventType: event.event });
+    eventRecord = await WebhookEvent.create({ razorpayEventId: idempotencyKey, eventType: event.event });
   } catch (err) {
     if (err.code === 11000) {
       console.log(`[razorpay webhook] duplicate delivery for ${idempotencyKey}, already processed — skipping`);
@@ -109,22 +113,70 @@ async function processRazorpayEvent(event) {
 
   console.log(`[razorpay webhook] processing ${idempotencyKey}`);
 
-  switch (event.event) {
-    case 'payment.captured':
-      await handlePaymentCaptured(event.payload.payment.entity);
-      break;
-    case 'payment.failed':
-      await handlePaymentFailed(event.payload.payment.entity);
-      break;
-    case 'order.paid':
-      await handleOrderPaid(event.payload.order.entity);
-      break;
-    case 'refund.processed':
-      await handleRefundProcessed(event.payload.refund.entity);
-      break;
-    default:
-      console.log(`[razorpay webhook] unhandled event type ${event.event}, ignoring`);
+  try {
+    switch (event.event) {
+      case 'payment.captured':
+        await handlePaymentCaptured(event.payload.payment.entity);
+        break;
+      case 'payment.failed':
+        await handlePaymentFailed(event.payload.payment.entity);
+        break;
+      case 'order.paid':
+        await handleOrderPaid(event.payload.order.entity, event.payload.payment?.entity);
+        break;
+      case 'refund.processed':
+        await handleRefundEvent(event.payload.refund.entity, 'processed');
+        break;
+      case 'refund.failed':
+        await handleRefundEvent(event.payload.refund.entity, 'failed');
+        break;
+      default:
+        console.log(`[razorpay webhook] unhandled event type ${event.event}, ignoring`);
+    }
+  } catch (err) {
+    // Release the idempotency key so Razorpay's next retry of this event is
+    // processed instead of being skipped as a "duplicate" of a failed run.
+    await WebhookEvent.deleteOne({ _id: eventRecord._id }).catch(() => {});
+    throw err;
   }
+}
+
+// Shared by payment.captured and order.paid: the pending→paid transition,
+// guarded so it happens once, and only for the exact amount we asked for.
+async function markOrderPaid(order, payment) {
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'refunded') {
+    console.log(`[razorpay webhook] order ${order.orderNumber} already ${order.paymentStatus}, skipping`);
+    return;
+  }
+
+  const expectedPaise = Math.round(order.totalAmount * 100);
+  if (payment?.amount != null && Number(payment.amount) !== expectedPaise) {
+    console.error(`[razorpay webhook] order ${order.orderNumber}: paid ${payment.amount} paise but expected ${expectedPaise} — not marking paid`);
+    notificationService.notifyAdmin(`Order ${order.orderNumber}: Razorpay payment amount (${payment.amount / 100}) does not match order total (${order.totalAmount}). Check it manually.`);
+    return;
+  }
+
+  order.razorpay = order.razorpay || {};
+  if (payment) {
+    order.razorpay.paymentId = payment.id;
+    order.razorpay.method = payment.method;
+    order.razorpay.capturedAt = new Date((payment.created_at || Date.now() / 1000) * 1000);
+  }
+  order.paymentStatus = 'paid';
+  order.paidAt = new Date();
+
+  if (order.orderStatus === 'cancelled') {
+    // Paid after the payment window expired and the order was released —
+    // send the money straight back.
+    await refundItems(order, order.items, { reason: 'Payment received after the order expired' });
+    await order.save();
+    console.log(`[razorpay webhook] order ${order.orderNumber} was already cancelled — late payment refunded`);
+    return;
+  }
+
+  await order.save();
+  console.log(`[razorpay webhook] order ${order.orderNumber} marked paid (${payment?.id || 'order.paid'})`);
+  onOnlineOrderPaid(order);
 }
 
 async function handlePaymentCaptured(payment) {
@@ -133,51 +185,7 @@ async function handlePaymentCaptured(payment) {
     console.warn(`[razorpay webhook] payment.captured for unknown razorpay order ${payment.order_id}`);
     return;
   }
-
-  if (order.paymentStatus === 'paid') {
-    console.log(`[razorpay webhook] order ${order.orderNumber} already paid, skipping payment.captured`);
-    return;
-  }
-
-  order.razorpay = order.razorpay || {};
-  order.razorpay.orderId = payment.order_id;
-  order.razorpay.paymentId = payment.id;
-  order.razorpay.method = payment.method;
-  order.razorpay.capturedAt = new Date((payment.created_at || Date.now() / 1000) * 1000);
-  order.paymentStatus = 'paid';
-  await order.save();
-
-  console.log(`[razorpay webhook] order ${order.orderNumber} marked paid via payment.captured (${payment.id})`);
-
-  // No longer auto-fires fulfillment here (or from orderController's
-  // verifyPayment — see that file's comment): items already sit in
-  // sellerOrderStatus 'awaiting_seller' from order creation, and now wait
-  // for each seller to explicitly accept before anything ships. Payment
-  // confirmation only unblocks the accept action's own payment-status guard
-  // (sellerOrderActionController.acceptSellerItem) — it doesn't trigger
-  // anything by itself.
-  // Their items were sitting in 'awaiting_seller' since creation but
-  // couldn't actually be accepted (acceptSellerItem's payment-status guard)
-  // until this exact moment — worth a nudge now that they can act on it.
-  const notifiedSellers = new Set();
-  order.items.forEach((item) => {
-    const sellerId = String(item.seller);
-    if (notifiedSellers.has(sellerId)) return;
-    notifiedSellers.add(sellerId);
-    notificationService.notifySeller(sellerId, `Payment confirmed for order ${order.orderNumber} — you can now accept this order`);
-  });
-
-  // Cart clearing: CartService.checkout() on the frontend already clears the
-  // cart right after order creation (before payment even starts), so there's
-  // nothing left to clear here — see cart.service.ts.
-  //
-  // Order-confirmation email/notification: no such service exists anywhere
-  // in this codebase yet, so there's nothing to hook into.
-  //
-  // Multi-vendor seller-split: Order.items[].itemStatus tracks per-item
-  // FULFILLMENT progress (placed/packed/shipped/...), not payment — payment
-  // is only ever tracked at the parent Order level, so there is no
-  // per-seller payment field to update even when items span sellers.
+  await markOrderPaid(order, payment);
 }
 
 async function handlePaymentFailed(payment) {
@@ -187,14 +195,12 @@ async function handlePaymentFailed(payment) {
     return;
   }
 
-  if (order.paymentStatus === 'paid') {
-    console.log(`[razorpay webhook] order ${order.orderNumber} already paid, ignoring stale payment.failed`);
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'refunded') {
+    console.log(`[razorpay webhook] order ${order.orderNumber} already ${order.paymentStatus}, ignoring stale payment.failed`);
     return;
   }
 
   order.razorpay = order.razorpay || {};
-  order.razorpay.orderId = payment.order_id;
-  order.razorpay.paymentId = payment.id;
   order.razorpay.failureReason = payment.error_code;
   order.razorpay.failureDescription = payment.error_description;
   order.paymentStatus = 'failed';
@@ -203,40 +209,33 @@ async function handlePaymentFailed(payment) {
   console.log(`[razorpay webhook] order ${order.orderNumber} marked payment failed (${payment.error_code})`);
 }
 
-// Fires alongside payment.captured as a second, redundant confirmation for
-// the same event — guarded purely by the paymentStatus check below so it
-// never overwrites anything payment.captured (or a refund) already set.
-async function handleOrderPaid(razorpayOrder) {
+// Fires alongside payment.captured as a redundant confirmation; markOrderPaid
+// makes the second one a no-op.
+async function handleOrderPaid(razorpayOrder, payment) {
   const order = await Order.findOne({ 'razorpay.orderId': razorpayOrder.id });
   if (!order) {
     console.warn(`[razorpay webhook] order.paid for unknown razorpay order ${razorpayOrder.id}`);
     return;
   }
-
-  if (order.paymentStatus === 'paid') return;
-
-  order.paymentStatus = 'paid';
-  await order.save();
-  console.log(`[razorpay webhook] order ${order.orderNumber} marked paid via order.paid safety net`);
+  await markOrderPaid(order, payment || { amount: razorpayOrder.amount_paid });
 }
 
-async function handleRefundProcessed(refund) {
-  const order = await Order.findOne({ 'razorpay.paymentId': refund.payment_id });
+async function handleRefundEvent(refund, status) {
+  const order =
+    (await Order.findOne({ 'refunds.razorpayRefundId': refund.id })) ||
+    (await Order.findOne({ 'razorpay.paymentId': refund.payment_id }));
   if (!order) {
-    console.warn(`[razorpay webhook] refund.processed for unknown payment ${refund.payment_id}`);
+    console.warn(`[razorpay webhook] refund.${status} for unknown payment ${refund.payment_id}`);
     return;
   }
 
-  // TODO: there's no dedicated Refund/Return model in this codebase — if
-  // partial or multiple refunds per order are ever needed, add one keyed by
-  // the Razorpay refund id (refund.id) instead of collapsing everything onto
-  // the parent Order's single refundStatus field, which can only represent
-  // one refund per order.
-  order.refundStatus = 'refunded';
-  order.paymentStatus = 'refunded';
+  applyRefundWebhook(order, refund, status);
   await order.save();
 
-  console.log(`[razorpay webhook] order ${order.orderNumber} marked refunded (refund ${refund.id})`);
+  console.log(`[razorpay webhook] order ${order.orderNumber}: refund ${refund.id} ${status} (order refundStatus=${order.refundStatus})`);
+  if (status === 'failed') {
+    notificationService.notifyAdmin(`Refund ${refund.id} for order ${order.orderNumber} FAILED at Razorpay. Retry it from the admin panel.`);
+  }
 }
 
 // POST /api/webhooks/shiprocket
@@ -255,10 +254,19 @@ async function handleRefundProcessed(refund) {
 // call specifically so the very first real delivery can be used to verify
 // (or correct) these field names.
 const handleShiprocketWebhook = (req, res) => {
+  // Fail closed: in production an unset token means every call is
+  // rejected (previously it meant every call was *accepted*, so anyone could
+  // post a fake "Delivered" for any AWB). Outside production an unset token
+  // is allowed so the flow can be exercised locally.
   const expectedToken = process.env.SHIPROCKET_WEBHOOK_TOKEN;
+  if (!expectedToken && isProduction) {
+    console.error('[shiprocket webhook] rejected: SHIPROCKET_WEBHOOK_TOKEN is not configured');
+    return res.status(401).json({ message: 'Invalid webhook token' });
+  }
   if (expectedToken) {
-    const providedToken = req.headers['x-api-key'];
-    if (providedToken !== expectedToken) {
+    const provided = Buffer.from(String(req.headers['x-api-key'] || ''), 'utf8');
+    const expected = Buffer.from(expectedToken, 'utf8');
+    if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
       console.warn('[shiprocket webhook] rejected: token mismatch');
       return res.status(401).json({ message: 'Invalid webhook token' });
     }
@@ -337,7 +345,7 @@ async function processShiprocketWebhook(body) {
   const mapped = mapShiprocketStatus({ statusId: body.current_status_id, statusText: status });
 
   let touched = false;
-  let refundJustTriggered = false;
+  const returnedItems = []; // items whose return just arrived back at the seller — refunded below
   const newlyReachedStatuses = []; // { sellerOrderStatus, template } — for milestone SMS, only real transitions
 
   order.items.forEach((item) => {
@@ -413,18 +421,9 @@ async function processShiprocketWebhook(body) {
           newlyReachedStatuses.push({ templateKey: smsTemplateKey });
         }
 
-        // PART 2.11: a return arriving back at the seller is the trigger to
-        // set refundStatus — same "record intent, no real gateway refund
-        // call exists yet" pattern used everywhere else refundStatus is set
-        // in this codebase (rejectAndSettleItem, handleRefundProcessed).
-        if (
-          resolvedSellerStatus === 'return_delivered' &&
-          order.paymentMethod === 'online' &&
-          order.paymentStatus === 'paid' &&
-          order.refundStatus !== 'refunded'
-        ) {
-          order.refundStatus = 'refund_pending';
-          refundJustTriggered = true;
+        // A return arriving back at the seller is what triggers the refund.
+        if (resolvedSellerStatus === 'return_delivered') {
+          returnedItems.push(item);
         }
       }
     }
@@ -443,22 +442,27 @@ async function processShiprocketWebhook(body) {
   // (order-detail-page.ts's step tracker) that a new value would break.
   recalcOrderStatus(order);
   maybeStartReturnWindow(order);
+
+  if (returnedItems.length) {
+    const stillOut = order.items.some((item) => ['return_requested', 'return_picked'].includes(item.sellerOrderStatus));
+    if (!stillOut && order.returnStatus === 'requested') order.returnStatus = 'completed';
+    await refundItems(order, returnedItems, { reason: 'Return received by seller' });
+  }
   await order.save();
 
   const summary = summarizeFulfillment(order.items);
   console.log(`[shiprocket webhook] order ${order.orderNumber} updated: courierStatus="${status}" | fulfillment summary: ${JSON.stringify(summary)}`);
 
   newlyReachedStatuses.forEach(({ templateKey }) => {
-    notificationService.sendSms({
-      to: order.shippingAddress?.phone,
+    notificationService.notifyCustomer({
+      order,
       templateKey,
       vars: { orderNumber: order.orderNumber, awbNumber: awb, trackingUrl: awb ? `https://shiprocket.co/tracking/${awb}` : undefined },
     });
   });
 
-  if (refundJustTriggered) {
-    notificationService.sendSms({ to: order.shippingAddress?.phone, templateKey: 'REFUND_INITIATED', vars: { orderNumber: order.orderNumber } });
-    notificationService.notifyAdmin(`Order ${order.orderNumber}: return delivered back to seller, refund marked pending`);
+  if (returnedItems.length && order.paymentMethod === 'COD') {
+    notificationService.notifyAdmin(`Order ${order.orderNumber}: COD return received by the seller — refund the customer manually and mark it refunded.`);
   }
 }
 

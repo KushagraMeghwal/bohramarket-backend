@@ -173,6 +173,26 @@ async function stepAssignAwb(order, seller) {
   }
   const courierId = groupItems[0]?.shipment?.courierId;
 
+  // If the order was shipped by hand from the Shiprocket dashboard (e.g.
+  // after API assignment was refused), adopt that AWB instead of asking for
+  // a second one.
+  const shiprocketOrderId = groupItems[0]?.shipment?.shiprocketOrderId;
+  if (shiprocketOrderId) {
+    const existing = await shiprocketService.getAssignedAwb(shiprocketOrderId).catch((err) => {
+      console.warn(`[fulfillment] could not read Shiprocket order ${shiprocketOrderId} before assigning AWB: ${err.message}`);
+      return null;
+    });
+    if (existing?.awb) {
+      groupItems.forEach((item) => {
+        item.shipment.awbNumber = existing.awb;
+        if (existing.courierName) item.shipment.courierName = existing.courierName;
+      });
+      await order.save();
+      console.log(`[fulfillment] order ${order.orderNumber}: adopted AWB ${existing.awb} already assigned in Shiprocket`);
+      return { nextStep: 'request_pickup' };
+    }
+  }
+
   const response = await shiprocketService.assignAwb({ shipmentId, courierId });
   const data = response?.response?.data || response?.data || response;
   const awbCode = data?.awb_code;
@@ -271,8 +291,10 @@ async function stepGenerateInvoice(order, seller) {
 
   console.log(`[fulfillment] order ${order.orderNumber}, seller ${seller._id}: ready_to_ship (chain complete)`);
 
-  notificationService.sendSms({ to: order.shippingAddress?.phone, templateKey: 'ORDER_CONFIRMED', vars: { orderNumber: order.orderNumber } });
-  notificationService.notifyAdmin(`Order ${order.orderNumber}, seller ${seller._id} (${seller.businessName}): ready_to_ship`);
+  notificationService.notifyCustomer({ order, templateKey: 'ORDER_CONFIRMED', vars: { orderNumber: order.orderNumber } });
+  // Routine success — logged only; notifyAdmin now emails, and admins only
+  // need to hear about things that need a human.
+  console.log(`[fulfillment] order ${order.orderNumber}, seller ${seller._id} (${seller.businessName}): ready_to_ship`);
 
   return { nextStep: null };
 }

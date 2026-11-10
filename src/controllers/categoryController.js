@@ -1,4 +1,5 @@
 const Category = require('../models/Category');
+const Product = require('../models/Product');
 const asyncHandler = require('../utils/asyncHandler');
 
 // POST /api/categories
@@ -72,6 +73,18 @@ const deleteCategory = asyncHandler(async (req, res) => {
   const category = await Category.findById(req.params.id);
   if (!category) {
     return res.status(404).json({ message: 'Category not found' });
+  }
+
+  // Deleting a category that products still point at would leave those
+  // listings uncategorised (and break their pages) — hide it instead.
+  const [productCount, childCount] = await Promise.all([
+    Product.countDocuments({ category: category._id }),
+    Category.countDocuments({ parentCategory: category._id }),
+  ]);
+  if (productCount || childCount) {
+    return res.status(409).json({
+      message: `This category still has ${productCount} product(s) and ${childCount} sub-categor${childCount === 1 ? 'y' : 'ies'}. Move them or mark the category inactive instead.`,
+    });
   }
 
   await category.deleteOne();

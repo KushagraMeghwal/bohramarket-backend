@@ -12,21 +12,63 @@ const notificationService = require('../services/notification.service');
 const { computeShippingForCart, FLAT_SHIPPING_FEE: SHARED_FLAT_SHIPPING_FEE } = require('../services/shippingRate.service');
 const { computeShipmentDimensions } = require('../services/orderFulfillment.service');
 const { selectCourier } = require('../services/courierSelection.service');
+const { refundItems, retryRefund: retryRefundRecord } = require('../services/refund.service');
+const { rejectAndSettleItem } = require('../services/sellerItemSettlement.service');
+const { isRazorpayConfigured } = require('../config/env');
+const { MAX_QTY_PER_ITEM } = require('../config/shop');
 
-// Shared by both createOrder branches (COD and online) — every seller
-// represented in a freshly-placed order gets exactly one notification, even
-// if they have multiple items in it.
-function notifySellersOfNewOrder(order) {
-  const notified = new Set();
-  order.items.forEach((item) => {
-    const sellerId = String(item.seller);
-    if (notified.has(sellerId)) return;
-    notified.add(sellerId);
-    notificationService.notifySeller(sellerId, `New order item(s) awaiting your response — order ${order.orderNumber}`);
+const PHONE_PATTERN = /^[6-9]\d{9}$/;
+const PINCODE_PATTERN = /^\d{6}$/;
+const ADDRESS_FIELDS = ['fullName', 'phone', 'line1', 'line2', 'city', 'state', 'pincode', 'country'];
+
+// Only the known address fields, trimmed — the request body is never stored
+// as-is.
+function cleanAddress(address) {
+  const cleaned = {};
+  ADDRESS_FIELDS.forEach((field) => {
+    if (address?.[field] != null) cleaned[field] = String(address[field]).trim();
   });
+  return cleaned;
 }
 
-const generateOrderNumber = () => `BM${Date.now()}${Math.floor(Math.random() * 1000)}`;
+function validateShippingAddress(address) {
+  if (!address || typeof address !== 'object') return 'Shipping address is required';
+  const a = cleanAddress(address);
+  const missing = ['fullName', 'phone', 'line1', 'city', 'state', 'pincode'].filter((field) => !a[field]);
+  if (missing.length) return `Shipping address is missing: ${missing.join(', ')}`;
+  if (!PHONE_PATTERN.test(a.phone)) return 'Enter a valid 10-digit mobile number';
+  if (!PINCODE_PATTERN.test(a.pincode)) return 'Enter a valid 6-digit pincode';
+  return null;
+}
+
+// What the browser needs to open Razorpay checkout — nothing else from the
+// Razorpay API response is passed through.
+const publicRazorpayOrder = (rp) => ({ id: rp.id, amount: rp.amount, currency: rp.currency });
+
+const timingSafeEqualHex = (a, b) => {
+  const left = Buffer.from(String(a || ''), 'utf8');
+  const right = Buffer.from(String(b || ''), 'utf8');
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+};
+
+// Strips other sellers' items (and the buyer's email) from an order a seller
+// is looking at as the fulfilling seller, so in a multi-seller order no
+// seller sees what anyone else sold or charged.
+function redactForSeller(order, sellerId) {
+  const plain = order.toObject ? order.toObject() : order;
+  plain.items = plain.items.filter((item) => String(item.seller?._id ?? item.seller) === String(sellerId));
+  if (plain.customer && typeof plain.customer === 'object') delete plain.customer.email;
+  delete plain.razorpay;
+  delete plain.refunds;
+  return plain;
+}
+
+const clampLimit = (value, fallback = 20) => Math.min(Math.max(parseInt(value, 10) || fallback, 1), 100);
+const clampPage = (value) => Math.max(parseInt(value, 10) || 1, 1);
+
+const { notifySellersOfNewOrder, onOnlineOrderPaid } = require('../services/orderEvents.service');
+
+const generateOrderNumber = () => `BM${Date.now()}${crypto.randomInt(100, 1000)}`;
 
 // POST /api/orders
 // Recalculates every price server-side from the live Product documents —
@@ -43,6 +85,16 @@ const createOrder = asyncHandler(async (req, res) => {
   }
   if (!['online', 'COD'].includes(paymentMethod)) {
     return res.status(400).json({ message: "paymentMethod must be 'online' or 'COD'" });
+  }
+  const addressError = validateShippingAddress(shippingAddress);
+  if (addressError) {
+    return res.status(400).json({ message: addressError });
+  }
+  if (paymentMethod === 'online' && !isRazorpayConfigured()) {
+    return res.status(503).json({ message: 'Online payment is temporarily unavailable. Please choose Cash on Delivery.' });
+  }
+  if (items.length > 50) {
+    return res.status(400).json({ message: 'Too many items in one order' });
   }
 
   const productIds = items.map((i) => i.productId);
@@ -65,8 +117,8 @@ const createOrder = asyncHandler(async (req, res) => {
       failures.push({ productId, reason: 'Product is not available for purchase' });
       return;
     }
-    if (!qty || qty < 1) {
-      failures.push({ productId, reason: 'Invalid quantity' });
+    if (!Number.isInteger(qty) || qty < 1 || qty > MAX_QTY_PER_ITEM) {
+      failures.push({ productId, reason: `Quantity must be a whole number between 1 and ${MAX_QTY_PER_ITEM}` });
       return;
     }
     if (product.stock < qty) {
@@ -136,6 +188,25 @@ const createOrder = asyncHandler(async (req, res) => {
   const totalAmount = itemsTotal + shippingFee - discount;
   const orderNumber = generateOrderNumber();
 
+  // The Razorpay order is created *before* any stock is reserved: if Razorpay
+  // is down or rejects our keys, the customer gets an error and nothing is
+  // left behind. (It used to be created after the DB transaction, so a
+  // Razorpay failure stranded a stock-holding order with no way to pay.) An
+  // unused Razorpay order simply expires on their side.
+  let razorpayOrder;
+  if (paymentMethod === 'online') {
+    try {
+      razorpayOrder = await razorpay.orders.create({
+        amount: Math.round(totalAmount * 100),
+        currency: 'INR',
+        receipt: orderNumber,
+      });
+    } catch (err) {
+      console.error(`[orders] Razorpay order creation failed for ${orderNumber}:`, err?.error || err.message || err);
+      return res.status(502).json({ message: 'Could not start online payment right now. Please try again or choose Cash on Delivery.' });
+    }
+  }
+
   const session = await mongoose.startSession();
   let order;
 
@@ -158,7 +229,7 @@ const createOrder = asyncHandler(async (req, res) => {
             orderNumber,
             customer: req.user._id,
             items: orderItems,
-            shippingAddress,
+            shippingAddress: cleanAddress(shippingAddress),
             itemsTotal,
             shippingFee,
             discount,
@@ -166,6 +237,7 @@ const createOrder = asyncHandler(async (req, res) => {
             paymentMethod,
             paymentStatus: 'pending',
             orderStatus: 'placed',
+            ...(razorpayOrder ? { razorpay: { orderId: razorpayOrder.id } } : {}),
           },
         ],
         { session }
@@ -182,22 +254,10 @@ const createOrder = asyncHandler(async (req, res) => {
   }
 
   if (paymentMethod === 'online') {
-    const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(totalAmount * 100),
-      currency: 'INR',
-      receipt: order.orderNumber,
-    });
-    order.razorpay = { orderId: razorpayOrder.id };
-    await order.save();
-
-    // PART 1's flow sends "Order placed" immediately on placement for both
-    // COD and prepaid — not gated on payment succeeding. Not awaited:
-    // sendSms never blocks/throws (see notification.service.js), but there's
-    // no reason to hold the response on it either way.
-    notificationService.sendSms({ to: shippingAddress.phone, templateKey: 'ORDER_PLACED', vars: { orderNumber: order.orderNumber } });
-    notifySellersOfNewOrder(order);
-
-    return res.status(201).json({ order, razorpayOrder });
+    // Customer and sellers hear about a prepaid order only once it's paid
+    // (verifyPayment / payment.captured webhook) — an abandoned payment
+    // shouldn't send "order placed" emails for an order that will expire.
+    return res.status(201).json({ order, razorpayOrder: publicRazorpayOrder(razorpayOrder), razorpayKeyId: process.env.RAZORPAY_KEY_ID });
   }
 
   // Items already default to sellerOrderStatus 'awaiting_seller' (see
@@ -206,7 +266,7 @@ const createOrder = asyncHandler(async (req, res) => {
   // now waits for each seller to explicitly accept
   // (sellerOrderActionController.acceptSellerItem), per the seller-
   // acceptance flow.
-  notificationService.sendSms({ to: shippingAddress.phone, templateKey: 'ORDER_PLACED', vars: { orderNumber: order.orderNumber } });
+  notificationService.notifyCustomer({ order, templateKey: 'ORDER_PLACED', vars: { orderNumber: order.orderNumber } });
   notifySellersOfNewOrder(order);
 
   res.status(201).json({ order });
@@ -214,14 +274,20 @@ const createOrder = asyncHandler(async (req, res) => {
 
 // GET /api/orders
 const getOrders = asyncHandler(async (req, res) => {
-  const { status, paymentStatus, dateFrom, dateTo, seller, page = 1, limit = 20 } = req.query;
+  const { status, paymentStatus, dateFrom, dateTo, seller, scope } = req.query;
   const filter = {};
+  let redactForSellerId = null;
 
-  if (req.user.role === 'customer') {
+  // scope=buyer: "My Orders" — the orders this account placed, whatever its
+  // role (sellers and admins can shop too). Without it, a seller gets the
+  // orders containing their items and an admin gets everything.
+  if (req.user.role === 'customer' || scope === 'buyer') {
     filter.customer = req.user._id;
   } else if (req.user.role === 'seller') {
     const own = await Seller.findOne({ user: req.user._id });
-    filter['items.seller'] = own?._id;
+    if (!own) return res.json({ orders: [], total: 0, page: 1, limit: 0 });
+    filter['items.seller'] = own._id;
+    redactForSellerId = own._id;
   } else if (seller) {
     // Admin-only: drill into one seller's orders (see admin/orders' seller
     // list — clicking a seller filters to just their orders).
@@ -237,8 +303,8 @@ const getOrders = asyncHandler(async (req, res) => {
     if (dateTo) filter.createdAt.$lte = new Date(`${dateTo}T23:59:59.999Z`);
   }
 
-  const pageNum = Number(page);
-  const limitNum = Number(limit);
+  const pageNum = clampPage(req.query.page);
+  const limitNum = clampLimit(req.query.limit);
 
   const [orders, total] = await Promise.all([
     Order.find(filter)
@@ -250,7 +316,12 @@ const getOrders = asyncHandler(async (req, res) => {
     Order.countDocuments(filter),
   ]);
 
-  res.json({ orders, total, page: pageNum, limit: limitNum });
+  res.json({
+    orders: redactForSellerId ? orders.map((order) => redactForSeller(order, redactForSellerId)) : orders,
+    total,
+    page: pageNum,
+    limit: limitNum,
+  });
 });
 
 // GET /api/orders/:id
@@ -283,16 +354,20 @@ const getOrderById = asyncHandler(async (req, res) => {
     if (!ownsItem) {
       return res.status(403).json({ message: 'You have no items in this order' });
     }
+    return res.json({ order: redactForSeller(order, seller._id) });
   }
 
   res.json({ order });
 });
 
 // PATCH /api/orders/:id/admin-status
+// Admin override for the whole order. Items already cancelled/RTO are left
+// alone (they used to be overwritten, so a cancelled item could be "marked
+// delivered"); cancelling goes through the same settle path as every other
+// cancellation, so stock is restored and prepaid money refunded.
 const adminUpdateOrderStatus = asyncHandler(async (req, res) => {
-  const { status, refundStatus, shipment } = req.body;
+  const { status, shipment } = req.body;
   const validStatuses = ['placed', 'packed', 'shipped', 'delivered', 'cancelled', 'rto'];
-  const validRefundStatuses = ['refund_pending', 'refunded'];
 
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ message: 'Invalid status' });
@@ -303,41 +378,51 @@ const adminUpdateOrderStatus = asyncHandler(async (req, res) => {
     return res.status(404).json({ message: 'Order not found' });
   }
 
-  order.items.forEach((item) => {
-    item.itemStatus = status;
-
-    if (shipment || status === 'shipped' || status === 'delivered') {
-      const shipmentUpdate = { ...(item.shipment?.toObject?.() ?? {}), ...(shipment ?? {}) };
-      if (status === 'shipped') {
-        shipmentUpdate.shipmentStatus = shipmentUpdate.shipmentStatus ?? 'shipped';
-        shipmentUpdate.shippedAt = shipmentUpdate.shippedAt ?? new Date();
-      }
-      if (status === 'delivered') {
-        shipmentUpdate.shipmentStatus = 'delivered';
-        shipmentUpdate.deliveredAt = new Date();
-      }
-      item.shipment = shipmentUpdate;
-    }
-  });
-
-  order.orderStatus = status;
-  maybeStartReturnWindow(order);
-
-  if (refundStatus !== undefined) {
-    if (!validRefundStatuses.includes(refundStatus)) {
-      return res.status(400).json({ message: 'Invalid refund status' });
-    }
-    order.refundStatus = refundStatus;
-    if (refundStatus === 'refunded') {
-      order.paymentStatus = 'refunded';
-    }
+  const activeItems = order.items.filter((item) => !TERMINAL_ITEM_STATUSES.includes(item.itemStatus));
+  if (activeItems.length === 0) {
+    return res.status(400).json({ message: `Every item in this order is already ${order.orderStatus}` });
+  }
+  if (!TERMINAL_ITEM_STATUSES.includes(status) && activeItems.some((item) => ITEM_STATUS_RANK[status] < ITEM_STATUS_RANK[item.itemStatus])) {
+    return res.status(400).json({ message: `Some items are already past '${status}' — order status can't move backward` });
   }
 
+  if (status === 'cancelled') {
+    for (const item of activeItems) {
+      if (item.itemStatus === 'shipped' || item.itemStatus === 'delivered') continue;
+      await rejectAndSettleItem(order, item, { reason: req.body.reason || 'Cancelled by BohraMart', source: 'admin', sellerOrderStatus: 'cancelled' });
+    }
+    order.cancelReason = req.body.reason || order.cancelReason;
+  } else {
+    activeItems.forEach((item) => {
+      item.itemStatus = status;
+      item.statusHistory.push({ status, source: 'admin', at: new Date() });
+
+      if (shipment || status === 'shipped' || status === 'delivered') {
+        const shipmentUpdate = { ...(item.shipment?.toObject?.() ?? {}), ...(shipment ?? {}) };
+        if (status === 'shipped') {
+          shipmentUpdate.shipmentStatus = shipmentUpdate.shipmentStatus ?? 'shipped';
+          shipmentUpdate.shippedAt = shipmentUpdate.shippedAt ?? new Date();
+        }
+        if (status === 'delivered') {
+          shipmentUpdate.shipmentStatus = 'delivered';
+          shipmentUpdate.deliveredAt = new Date();
+          item.sellerOrderStatus = 'delivered';
+        }
+        item.shipment = shipmentUpdate;
+      }
+    });
+    recalcOrderStatus(order);
+  }
+
+  maybeStartReturnWindow(order);
   await order.save();
   res.json({ order });
 });
 
 // PATCH /api/orders/:id/refund-status
+// Manual bookkeeping for refunds settled outside Razorpay (COD orders paid
+// back by bank transfer / UPI). Online refunds are tracked automatically
+// from Razorpay and can't be overridden here.
 const updateRefundStatus = asyncHandler(async (req, res) => {
   const { refundStatus } = req.body;
   if (!['refund_pending', 'refunded'].includes(refundStatus)) {
@@ -348,6 +433,9 @@ const updateRefundStatus = asyncHandler(async (req, res) => {
   if (!order) {
     return res.status(404).json({ message: 'Order not found' });
   }
+  if (order.paymentMethod === 'online') {
+    return res.status(400).json({ message: 'Online-payment refunds are processed through Razorpay automatically — use "Retry refund" if one failed.' });
+  }
 
   order.refundStatus = refundStatus;
   if (refundStatus === 'refunded') {
@@ -356,6 +444,59 @@ const updateRefundStatus = asyncHandler(async (req, res) => {
 
   await order.save();
   res.json({ order });
+});
+
+// POST /api/orders/:id/refunds/:refundId/retry (admin)
+const retryRefund = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+  const refund = await retryRefundRecord(order, req.params.refundId);
+  await order.save();
+  if (refund.status === 'failed') {
+    return res.status(502).json({ message: `Razorpay rejected the refund again: ${refund.error}`, order });
+  }
+  res.json({ order });
+});
+
+// POST /api/orders/:id/pay
+// Lets a customer finish paying for an online order whose Razorpay window
+// was closed or whose payment failed, instead of the order being stuck.
+const payOrder = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) {
+    return res.status(404).json({ message: 'Order not found' });
+  }
+  if (String(order.customer) !== String(req.user._id)) {
+    return res.status(403).json({ message: 'Not your order' });
+  }
+  if (order.paymentMethod !== 'online') {
+    return res.status(400).json({ message: 'This is a Cash on Delivery order' });
+  }
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'refunded') {
+    return res.status(400).json({ message: 'This order is already paid' });
+  }
+  if (order.orderStatus === 'cancelled') {
+    return res.status(400).json({ message: 'This order has expired. Please place a new order.' });
+  }
+  if (!isRazorpayConfigured()) {
+    return res.status(503).json({ message: 'Online payment is temporarily unavailable.' });
+  }
+
+  // A Razorpay order accepts repeated attempts until one succeeds, so the
+  // original one is reused — keeping verifyPayment's order-id binding intact.
+  let razorpayOrder;
+  if (order.razorpay?.orderId) {
+    razorpayOrder = { id: order.razorpay.orderId, amount: Math.round(order.totalAmount * 100), currency: 'INR' };
+  } else {
+    const created = await razorpay.orders.create({ amount: Math.round(order.totalAmount * 100), currency: 'INR', receipt: order.orderNumber });
+    order.razorpay = { orderId: created.id };
+    await order.save();
+    razorpayOrder = publicRazorpayOrder(created);
+  }
+
+  res.json({ order, razorpayOrder, razorpayKeyId: process.env.RAZORPAY_KEY_ID });
 });
 
 // POST /api/orders/:id/verify-payment
@@ -373,22 +514,50 @@ const verifyPayment = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'This order is not an online payment order' });
   }
 
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    return res.status(400).json({ message: 'razorpayOrderId, razorpayPaymentId and razorpaySignature are required' });
+  }
+
+  // The signature only proves Razorpay saw *some* successful payment for
+  // razorpayOrderId. It must also be the Razorpay order we created for this
+  // order (and therefore for this exact amount) — otherwise a payment proof
+  // from a cheap order could be replayed to mark an expensive one paid.
+  if (!order.razorpay?.orderId || razorpayOrderId !== order.razorpay.orderId) {
+    console.warn(`[verify-payment] order ${order.orderNumber}: razorpayOrderId mismatch (got ${razorpayOrderId}, expected ${order.razorpay?.orderId})`);
+    return res.status(400).json({ message: 'Payment does not belong to this order' });
+  }
+
   const expectedSignature = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '')
     .update(`${razorpayOrderId}|${razorpayPaymentId}`)
     .digest('hex');
 
-  if (expectedSignature !== razorpaySignature) {
+  if (!timingSafeEqualHex(expectedSignature, razorpaySignature)) {
     return res.status(400).json({ message: 'Payment signature verification failed' });
   }
 
+  if (order.paymentStatus === 'paid' || order.paymentStatus === 'refunded') {
+    return res.json({ order });
+  }
+  if (order.orderStatus === 'cancelled') {
+    // Paid after the payment window expired and the order was cancelled —
+    // money must go straight back.
+    order.paymentStatus = 'paid';
+    order.paidAt = new Date();
+    order.razorpay.paymentId = razorpayPaymentId;
+    order.razorpay.signature = razorpaySignature;
+    await refundItems(order, order.items, { reason: 'Payment received after the order expired' });
+    await order.save();
+    return res.status(409).json({ message: 'This order had already expired, so your payment is being refunded.', order });
+  }
+
   order.paymentStatus = 'paid';
-  order.razorpay = {
-    orderId: razorpayOrderId,
-    paymentId: razorpayPaymentId,
-    signature: razorpaySignature,
-  };
+  order.paidAt = new Date();
+  order.razorpay.paymentId = razorpayPaymentId;
+  order.razorpay.signature = razorpaySignature;
   await order.save();
+
+  onOnlineOrderPaid(order);
 
   // Same as createOrder's COD path: items are already 'awaiting_seller' by
   // default, so payment confirmation alone doesn't trigger fulfillment
@@ -459,6 +628,11 @@ const updateItemStatus = asyncHandler(async (req, res) => {
     if (!seller || String(item.seller) !== String(seller._id)) {
       return res.status(403).json({ message: 'You do not own this item' });
     }
+    // Packing/shipping an item the seller never accepted would skip
+    // shipment booking, and the response-window job would still cancel it.
+    if (item.sellerOrderStatus === 'awaiting_seller' && status !== 'cancelled') {
+      return res.status(400).json({ message: 'Accept this order item first' });
+    }
   }
 
   if (TERMINAL_ITEM_STATUSES.includes(item.itemStatus)) {
@@ -469,7 +643,24 @@ const updateItemStatus = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: `Cannot move item status backward from ${item.itemStatus} to ${status}` });
   }
 
+  // Cancelling an item releases its stock and refunds it if prepaid — the
+  // same settle path seller-reject and timeouts use.
+  if (status === 'cancelled') {
+    if (item.itemStatus === 'shipped' || item.itemStatus === 'delivered') {
+      return res.status(400).json({ message: 'A shipped item cannot be cancelled — it has to come back as a return or RTO' });
+    }
+    await rejectAndSettleItem(order, item, {
+      reason: req.body.reason || `Cancelled by ${req.user.role}`,
+      source: req.user.role === 'admin' ? 'admin' : 'seller',
+      sellerOrderStatus: 'cancelled',
+    });
+    maybeStartReturnWindow(order);
+    await order.save();
+    return res.json({ order });
+  }
+
   item.itemStatus = status;
+  item.statusHistory.push({ status, source: req.user.role === 'admin' ? 'admin' : 'seller', at: new Date() });
 
   if (shipment || status === 'shipped' || status === 'delivered') {
     const shipmentUpdate = { ...(item.shipment?.toObject?.() ?? {}), ...(shipment ?? {}) };
@@ -480,6 +671,7 @@ const updateItemStatus = asyncHandler(async (req, res) => {
     if (status === 'delivered') {
       shipmentUpdate.shipmentStatus = 'delivered';
       shipmentUpdate.deliveredAt = new Date();
+      item.sellerOrderStatus = 'delivered';
     }
     item.shipment = shipmentUpdate;
   }
@@ -492,12 +684,10 @@ const updateItemStatus = asyncHandler(async (req, res) => {
 });
 
 // PATCH /api/orders/:id/cancel
-// Kept as the existing PATCH endpoint rather than adding a separate POST
-// route — this codebase already had a working cancelOrder (stock restore,
-// role checks, etc.) and the frontend already calls PATCH; a second route
-// doing overlapping-but-different cancel logic would be a bug waiting to
-// happen rather than a real addition. This now also tightens the allowed
-// states and cancels any Shiprocket shipment already created for the order.
+// Customer (or admin) cancels everything that hasn't shipped yet. Stock is
+// restored, any Shiprocket shipment cancelled, and a prepaid order refunded
+// through Razorpay for exactly the cancelled items (+ shipping once nothing
+// in the order will ship).
 const cancelOrder = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) {
@@ -505,46 +695,49 @@ const cancelOrder = asyncHandler(async (req, res) => {
   }
 
   // Only admins may cancel someone else's order; customer and seller
-  // accounts (sellers can place orders as buyers too, see orderRoutes.js
-  // BUYER_ROLES) may only cancel their own.
+  // accounts (sellers can place orders as buyers too) may only cancel their
+  // own.
   if (req.user.role !== 'admin' && String(order.customer) !== String(req.user._id)) {
     return res.status(403).json({ message: 'Not your order' });
   }
 
-  // Cancellation is only offered before the order ships — once a courier has
-  // picked it up, this needs to become a return instead (see requestReturn).
   if (!['placed', 'packed'].includes(order.orderStatus)) {
     return res.status(400).json({ message: `Order cannot be cancelled from status '${order.orderStatus}'` });
   }
 
-  const { reason } = req.body;
+  const reason = typeof req.body.reason === 'string' && req.body.reason.trim() ? req.body.reason.trim().slice(0, 300) : 'Cancelled by customer';
 
-  const cancellableItems = order.items.filter(
-    (item) => !TERMINAL_ITEM_STATUSES.includes(item.itemStatus) && item.itemStatus !== 'delivered'
+  const cancellableItems = order.items.filter((item) => ['placed', 'packed'].includes(item.itemStatus));
+  if (cancellableItems.length === 0) {
+    return res.status(400).json({ message: 'Nothing left in this order can be cancelled' });
+  }
+
+  // Claim the items atomically first: two simultaneous cancel clicks (or a
+  // cancel racing the seller-timeout job) must not both restore stock.
+  const claimed = await Order.updateOne(
+    { _id: order._id, orderStatus: { $in: ['placed', 'packed'] }, cancelReason: { $exists: false } },
+    { $set: { cancelReason: reason } }
   );
-
-  await Promise.all(
-    cancellableItems.map((item) =>
-      Product.findByIdAndUpdate(item.product, {
-        $inc: { stock: item.quantity, totalSold: -item.quantity },
-      })
-    )
-  );
-
-  cancellableItems.forEach((item) => {
-    item.itemStatus = 'cancelled';
-  });
-
-  order.orderStatus = 'cancelled';
+  if (claimed.modifiedCount === 0) {
+    return res.status(409).json({ message: 'This order is already being cancelled' });
+  }
   order.cancelReason = reason;
+
+  for (const item of cancellableItems) {
+    item.itemStatus = 'cancelled';
+    item.sellerOrderStatus = 'cancelled';
+    item.statusHistory.push({ status: 'cancelled', source: req.user.role === 'admin' ? 'admin' : 'system', at: new Date() });
+    await Product.findByIdAndUpdate(item.product, { $inc: { stock: item.quantity, totalSold: -item.quantity } });
+  }
+  recalcOrderStatus(order);
+
+  const refund = await refundItems(order, cancellableItems, { reason });
   await order.save();
 
-  // Best-effort: cancelling in our DB is the source of truth for the buyer;
-  // a Shiprocket API hiccup here shouldn't block that response. Only one
-  // cancel call per unique Shiprocket order id, since several items from the
-  // same seller share one Shiprocket order.
+  // Best-effort: one cancel call per Shiprocket order created for the
+  // cancelled items.
   const shiprocketOrderIds = [
-    ...new Set(order.items.map((item) => item.shipment?.shiprocketOrderId).filter(Boolean)),
+    ...new Set(cancellableItems.map((item) => item.shipment?.shiprocketOrderId).filter(Boolean)),
   ];
   await Promise.all(
     shiprocketOrderIds.map((id) =>
@@ -553,6 +746,19 @@ const cancelOrder = asyncHandler(async (req, res) => {
         .catch((err) => console.error(`[shiprocket] failed to cancel shipment order ${id}`, err))
     )
   );
+
+  const notifiedSellers = new Set();
+  cancellableItems.forEach((item) => {
+    const sellerId = String(item.seller);
+    if (notifiedSellers.has(sellerId)) return;
+    notifiedSellers.add(sellerId);
+    notificationService.notifySeller(sellerId, `Order ${order.orderNumber} was cancelled by the customer — do not ship it`);
+  });
+  notificationService.notifyCustomer({
+    order,
+    templateKey: 'CANCELLED',
+    vars: { orderNumber: order.orderNumber, reason, refund: !!refund && refund.status !== 'failed' },
+  });
 
   res.json({ order });
 });
@@ -689,13 +895,17 @@ const requestReturn = asyncHandler(async (req, res) => {
 
       notificationService.notifySeller(sellerId, `A return has been requested for order ${order.orderNumber} — pickup will be arranged.`);
 
-      notificationService.sendSms({
-        to: order.shippingAddress.phone,
+      notificationService.notifyCustomer({
+        order,
         templateKey: 'RETURN_INITIATED',
         vars: { orderNumber: order.orderNumber, returnAwbNumber: returnAwb },
       });
     } catch (err) {
       console.error(`[shiprocket] return request failed for order ${order.orderNumber}, seller ${sellerId}`, err);
+      // Keep whatever returns were already created for earlier sellers —
+      // dropping them here would orphan live Shiprocket pickups.
+      await order.save();
+      notificationService.notifyAdmin(`Return for order ${order.orderNumber} only partly created — seller ${sellerId} failed: ${err.message || err}`);
       return res.status(502).json({ message: 'Could not initiate the return with our courier partner. Please try again shortly.' });
     }
   }
@@ -794,4 +1004,6 @@ module.exports = {
   cancelOrder,
   requestReturn,
   trackOrder,
+  payOrder,
+  retryRefund,
 };

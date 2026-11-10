@@ -4,6 +4,7 @@
 // placeholders — replace via the real seller product-upload flow later.
 require('dotenv').config();
 const mongoose = require('mongoose');
+const { assertSafeDatabase } = require('./src/config/env');
 const User = require('./src/models/User');
 const Seller = require('./src/models/Seller');
 const Category = require('./src/models/Category');
@@ -19,12 +20,21 @@ const DEMO_IMAGES = [
 const mediaFrom = (url, i) => ({ url, publicId: `seed/placeholder-${i}` });
 
 const CATEGORIES = [
-  { name: 'Ridas', slug: 'ridas' },
-  { name: 'Topis', slug: 'topis' },
-  { name: 'Attars', slug: 'attars' },
-  { name: 'Jewelry', slug: 'jewelry' },
-  { name: 'Home Decor', slug: 'home-decor' },
-  { name: 'Handicrafts', slug: 'handicrafts' },
+  { name: 'Ridas', slug: 'ridas', type: 'clothing' },
+  { name: 'Topis', slug: 'topis', type: 'accessories' },
+  { name: 'Attars', slug: 'attars', type: 'other' },
+  { name: 'Jewellery', slug: 'jewelry', type: 'other' },
+  { name: 'Home Decor', slug: 'home-decor', type: 'other' },
+  { name: 'Handicrafts', slug: 'handicrafts', type: 'other' },
+];
+
+// Local test accounts (dev database only — assertSafeDatabase() below
+// refuses to run against anything not named *_dev / *_test). They share one
+// password, SEED_PASSWORD from .env, falling back to the value below.
+const SEED_PASSWORD = process.env.SEED_PASSWORD || 'DevOnly#2026';
+const TEST_ACCOUNTS = [
+  { name: 'Dev Admin', email: 'admin@bohramart.test', role: 'admin' },
+  { name: 'Dev Customer', email: 'customer@bohramart.test', role: 'customer' },
 ];
 
 const PRODUCTS = [
@@ -68,25 +78,32 @@ const PRODUCTS = [
 ];
 
 async function main() {
+  assertSafeDatabase();
   await mongoose.connect(process.env.MONGO_URI);
+
+  for (const account of TEST_ACCOUNTS) {
+    const existing = await User.findOne({ email: account.email });
+    if (!existing) await User.create({ ...account, password: SEED_PASSWORD, isEmailVerified: true });
+  }
+  console.log(`Test accounts ready: ${TEST_ACCOUNTS.map((a) => a.email).join(', ')}`);
 
   const categoryDocs = {};
   for (const c of CATEGORIES) {
     categoryDocs[c.slug] = await Category.findOneAndUpdate(
       { slug: c.slug },
-      { name: c.name, slug: c.slug },
+      { name: c.name, slug: c.slug, type: c.type },
       { upsert: true, returnDocument: 'after' }
     );
   }
   console.log(`Categories ready: ${Object.keys(categoryDocs).length}`);
 
-  const demoEmail = 'demo.seller@bohramart.com';
+  const demoEmail = 'seller@bohramart.test';
   let user = await User.findOne({ email: demoEmail });
   if (!user) {
     user = await User.create({
       name: 'BohraMart Demo Seller',
       email: demoEmail,
-      password: 'password123',
+      password: SEED_PASSWORD,
       role: 'seller',
     });
   }
@@ -97,7 +114,7 @@ async function main() {
       user: user._id,
       businessName: 'BohraMart Curated Collection',
       contactPhone: '9000000000',
-      pickupAddress: { line1: 'Demo Warehouse', city: 'Surat', state: 'Gujarat', pincode: '395001' },
+      pickupAddress: { line1: '12 Demo Warehouse Road', city: 'Surat', state: 'Gujarat', pincode: '395001' },
       status: 'approved',
     });
   } else if (seller.status !== 'approved') {
@@ -127,8 +144,8 @@ async function main() {
       attributes: p.attributes,
       status: 'active',
       isFeatured: i % 3 === 0,
-      ratingAverage: 3.5 + ((i % 3) * 0.5),
-      ratingCount: 4 + i,
+      weight: 0.5,
+      dimensions: { length: 20, width: 15, height: 5 },
     });
     created += 1;
   }

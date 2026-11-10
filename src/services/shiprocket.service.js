@@ -64,6 +64,21 @@ async function rawRequest(path, { method = 'GET', body, token }) {
 // happen if the account logs in elsewhere and rotates the token server-side
 // before our local TTL guess expires — forces one fresh login and retries
 // exactly once rather than failing the caller outright.
+// What an admin should actually do about a 401/403 from Shiprocket. Login and
+// order creation succeeding while AWB assignment is refused almost always
+// means the Shiprocket account itself isn't cleared to ship yet.
+function permissionHint(path) {
+  if (path.startsWith('/courier/assign/awb') || path.startsWith('/courier/generate/pickup')) {
+    return (
+      'Shiprocket refused to assign a courier for this order (permission denied). This is a Shiprocket account setting, not a site error: ' +
+      'make sure the Shiprocket account KYC is verified (Settings → Company → KYC), the wallet has balance, and the API user ' +
+      '(Settings → API → Configure) has permission to ship orders. Then press Retry — or ship the order from the Shiprocket ' +
+      'dashboard ("Ship Now") and press Retry so the site picks up the AWB.'
+    );
+  }
+  return 'Shiprocket refused this request (permission denied). Check that the API user (Settings → API → Configure) has access to this action, then press Retry.';
+}
+
 async function shiprocketFetch(path, options = {}) {
   const token = await getToken();
 
@@ -96,6 +111,13 @@ async function shiprocketFetch(path, options = {}) {
     // callers that need field-level detail (see parseShiprocketError below)
     // don't have to re-parse it back out of the message string.
     httpErr.responseBody = data;
+    // A permission refusal won't change by retrying — it needs someone to fix
+    // the Shiprocket account. Flag it so the job queue stops immediately and
+    // tells the admin what to do instead of burning its retries.
+    if (res.status === 401 || res.status === 403) {
+      httpErr.permanent = true;
+      httpErr.adminHint = permissionHint(path);
+    }
     throw httpErr;
   }
 
@@ -295,6 +317,19 @@ async function checkReturnServiceability({ customerPincode, sellerPincode, weigh
 // Response shape (per docs): { response: { data: { awb_code, courier_name,
 //   courier_company_id, ... } } } — read defensively by the caller since
 // this hasn't been verified live.
+// Reads back an order we created, to pick up an AWB that someone assigned
+// from the Shiprocket dashboard ("Ship Now") instead of through the API.
+// Returns { awb, courierName } or null. Response shape varies by account, so
+// every field is read defensively.
+async function getAssignedAwb(shiprocketOrderId) {
+  const response = await shiprocketFetch(`/orders/show/${encodeURIComponent(shiprocketOrderId)}`);
+  const data = response?.data || response;
+  const shipment = Array.isArray(data?.shipments) ? data.shipments[0] : data?.shipments;
+  const awb = data?.awb_data?.awb || shipment?.awb || shipment?.awb_code || data?.awb_code;
+  if (!awb) return null;
+  return { awb: String(awb), courierName: shipment?.courier || shipment?.courier_name || data?.courier_name };
+}
+
 async function assignAwb({ shipmentId, courierId }) {
   const body = { shipment_id: shipmentId };
   if (courierId != null) body.courier_id = courierId;
@@ -409,6 +444,7 @@ module.exports = {
   checkServiceability,
   checkReturnServiceability,
   assignAwb,
+  getAssignedAwb,
   requestPickup,
   generateLabel,
   generateInvoice,
